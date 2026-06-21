@@ -1,15 +1,15 @@
 #!/bin/bash
 set -e
 
-# 🔴 Coloque aqui o link atual do Dropbox (ou qualquer outra fonte)
-DROPBOX_URL="https://www.dropbox.com/scl/fi/iiw0m08fuonuusni1glru/app.tar.gz?rlkey=h4jpc292g7ijyn4q14o72qxqi&dl=0" 
+# 🔴 Substitua pela sua URL do Dropbox (agora com .zip)
+DROPBOX_URL="https://www.dropbox.com/scl/fi/nfcaf9lm2q83f2ku7rxs3/app.zip?rlkey=92gmf967ddkycpqdoboj4gzzz&dl=0"
 
-echo "📦 Baixando aplicação do Dropbox..."
-curl -L "$DROPBOX_URL" -o /tmp/app.tar.gz
+echo "📦 Baixando aplicação (formato ZIP) do Dropbox..."
+curl -L "$DROPBOX_URL" -o /tmp/app.zip
 
 echo "📂 Extraindo arquivos em /app..."
-tar xzf /tmp/app.tar.gz -C /app
-rm /tmp/app.tar.gz
+unzip -q /tmp/app.zip -d /app
+rm /tmp/app.zip
 
 # Instala dependências (caso o requirements.txt tenha mudado)
 if [ -f /app/requirements.txt ]; then
