@@ -2,7 +2,7 @@
 set -e
 
 # 🔴 Coloque aqui o link atual do Dropbox (ou qualquer outra fonte)
-DROPBOX_URL="https://www.dropbox.com/s/xxxxxxxxxxxx/app.tar.gz?dl=1"
+DROPBOX_URL="https://www.dropbox.com/scl/fi/iiw0m08fuonuusni1glru/app.tar.gz?rlkey=h4jpc292g7ijyn4q14o72qxqi&dl=0" 
 
 echo "📦 Baixando aplicação do Dropbox..."
 curl -L "$DROPBOX_URL" -o /tmp/app.tar.gz
