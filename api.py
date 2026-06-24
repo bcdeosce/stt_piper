@@ -22,8 +22,8 @@ from pydantic import BaseModel, Field
 from pydub import AudioSegment
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
-# Piper imports corrigidos
-from piper import PiperVoice, SynthesisConfig
+# Piper – APENAS PiperVoice (não existe SynthesisConfig)
+from piper import PiperVoice
 
 # =============================================================================
 # Configuração de logging
@@ -47,7 +47,7 @@ def run_cmd(cmd: list, timeout=10):
         return f"Erro: {e}"
 
 # =============================================================================
-# Diagnóstico inicial (GPU, ONNX, etc.)
+# Diagnóstico inicial
 # =============================================================================
 logger.info("=" * 70)
 logger.info("DIAGNÓSTICO DE AMBIENTE")
@@ -61,7 +61,7 @@ try:
     if 'CUDAExecutionProvider' in providers:
         logger.info("✅ CUDAExecutionProvider disponível – GPU ativa")
     else:
-        logger.warning("⚠️ CUDAExecutionProvider NÃO encontrado")
+        logger.warning("⚠️ CUDAExecutionProvider NÃO encontrado – verifique onnxruntime-gpu")
 except ImportError:
     logger.error("onnxruntime não instalado!")
 logger.info("=" * 70)
@@ -85,7 +85,7 @@ mixing_executor = ProcessPoolExecutor(max_workers=MIXING_PROCESSES)
 logger.info(f"Paralelismo: {SYNTHESIS_THREADS} threads síntese, {MIXING_PROCESSES} processos mixagem, pool={SESSION_POOL_SIZE}")
 
 # =============================================================================
-# Pool de sessões ONNX por voz (thread‑safe, usando SynthesisConfig)
+# Pool de sessões ONNX por voz (thread‑safe, chamada direta sem SynthesisConfig)
 # =============================================================================
 class VoiceSessionPool:
     def __init__(self, model_path: str, config_path: str):
@@ -112,14 +112,14 @@ class VoiceSessionPool:
     def synthesize(self, text: str, length_scale: float, noise_scale: float, noise_w_scale: float) -> Tuple[bytes, int]:
         voice = self.pool.get()
         try:
-            # CORREÇÃO: usa SynthesisConfig
-            config = SynthesisConfig(
+            # Chamada direta com parâmetros (API oficial piper 1.2.0)
+            audio_stream = voice.synthesize(
+                text,
                 length_scale=length_scale,
                 noise_scale=noise_scale,
-                noise_w=noise_w_scale,   # <-- atenção: o parâmetro é 'noise_w'
+                noise_w=noise_w_scale,
                 volume=1.0
             )
-            audio_stream = voice.synthesize(text, syn_config=config)
             pcm = b''.join(chunk.audio_int16_bytes for chunk in audio_stream)
             sample_rate = voice.config.sample_rate
             return pcm, sample_rate
@@ -127,7 +127,7 @@ class VoiceSessionPool:
             self.pool.put(voice)
 
 # =============================================================================
-# Carregamento das vozes (metadados e pool)
+# Carregamento das vozes
 # =============================================================================
 voice_pools: Dict[str, VoiceSessionPool] = {}
 
@@ -192,7 +192,7 @@ else:
 logger.info("=" * 70)
 
 # =============================================================================
-# Função de mixagem para ProcessPoolExecutor
+# Mixagem para ProcessPoolExecutor
 # =============================================================================
 def mixing_task(ordered_items, ambient_bytes, ambient_volume_db, target_dbfs=-20.0):
     import logging as mix_log
