@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Piper TTS API – GPU via piper-tts Python + onnxruntime-gpu
-Arquitetura: pool de sessões ONNX por voz → síntese paralela (threads) → mixagem em processos separados
+Arquitetura: pool de sessões ONNX por voz → síntese paralela → mixagem em processos separados
 """
 
 import os
@@ -11,7 +11,6 @@ import json
 import time
 import queue
 import logging
-import threading
 import asyncio
 import subprocess
 from pathlib import Path
@@ -23,8 +22,8 @@ from pydantic import BaseModel, Field
 from pydub import AudioSegment
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
-# Piper
-from piper import PiperVoice
+# Piper imports corrigidos
+from piper import PiperVoice, SynthesisConfig
 
 # =============================================================================
 # Configuração de logging
@@ -48,7 +47,7 @@ def run_cmd(cmd: list, timeout=10):
         return f"Erro: {e}"
 
 # =============================================================================
-# Diagnóstico inicial
+# Diagnóstico inicial (GPU, ONNX, etc.)
 # =============================================================================
 logger.info("=" * 70)
 logger.info("DIAGNÓSTICO DE AMBIENTE")
@@ -62,14 +61,13 @@ try:
     if 'CUDAExecutionProvider' in providers:
         logger.info("✅ CUDAExecutionProvider disponível – GPU ativa")
     else:
-        logger.warning("⚠️ CUDAExecutionProvider NÃO encontrado – verifique onnxruntime-gpu")
+        logger.warning("⚠️ CUDAExecutionProvider NÃO encontrado")
 except ImportError:
     logger.error("onnxruntime não instalado!")
-
 logger.info("=" * 70)
 
 # =============================================================================
-# Diretórios e parâmetros
+# Diretórios e parâmetros de paralelismo
 # =============================================================================
 BASE_DIR = Path("/app")
 VOICES_DIR = BASE_DIR / "voices"
@@ -84,11 +82,10 @@ SESSION_POOL_SIZE = int(os.getenv("SESSION_POOL_SIZE", "2"))
 
 synthesis_executor = ThreadPoolExecutor(max_workers=SYNTHESIS_THREADS)
 mixing_executor = ProcessPoolExecutor(max_workers=MIXING_PROCESSES)
-
 logger.info(f"Paralelismo: {SYNTHESIS_THREADS} threads síntese, {MIXING_PROCESSES} processos mixagem, pool={SESSION_POOL_SIZE}")
 
 # =============================================================================
-# Pool de sessões ONNX por voz (thread‑safe)
+# Pool de sessões ONNX por voz (thread‑safe, usando SynthesisConfig)
 # =============================================================================
 class VoiceSessionPool:
     def __init__(self, model_path: str, config_path: str):
@@ -100,7 +97,11 @@ class VoiceSessionPool:
     def _init_sessions(self):
         for i in range(SESSION_POOL_SIZE):
             try:
-                voice = PiperVoice.load(self.model_path, config_path=self.config_path, use_cuda=True)
+                voice = PiperVoice.load(
+                    self.model_path,
+                    config_path=self.config_path,
+                    use_cuda=True
+                )
                 self.pool.put(voice)
                 logger.info(f"  → Sessão {i+1}/{SESSION_POOL_SIZE} para {Path(self.model_path).stem}")
             except Exception as e:
@@ -111,12 +112,14 @@ class VoiceSessionPool:
     def synthesize(self, text: str, length_scale: float, noise_scale: float, noise_w_scale: float) -> Tuple[bytes, int]:
         voice = self.pool.get()
         try:
-            audio_stream = voice.synthesize(
-                text,
+            # CORREÇÃO: usa SynthesisConfig
+            config = SynthesisConfig(
                 length_scale=length_scale,
                 noise_scale=noise_scale,
-                noise_w=noise_w_scale
+                noise_w=noise_w_scale,   # <-- atenção: o parâmetro é 'noise_w'
+                volume=1.0
             )
+            audio_stream = voice.synthesize(text, syn_config=config)
             pcm = b''.join(chunk.audio_int16_bytes for chunk in audio_stream)
             sample_rate = voice.config.sample_rate
             return pcm, sample_rate
@@ -124,7 +127,7 @@ class VoiceSessionPool:
             self.pool.put(voice)
 
 # =============================================================================
-# Carregamento das vozes
+# Carregamento das vozes (metadados e pool)
 # =============================================================================
 voice_pools: Dict[str, VoiceSessionPool] = {}
 
@@ -189,7 +192,7 @@ else:
 logger.info("=" * 70)
 
 # =============================================================================
-# Função de mixagem (para ProcessPoolExecutor)
+# Função de mixagem para ProcessPoolExecutor
 # =============================================================================
 def mixing_task(ordered_items, ambient_bytes, ambient_volume_db, target_dbfs=-20.0):
     import logging as mix_log
@@ -254,7 +257,7 @@ class TTSRequest(BaseModel):
 # =============================================================================
 # FastAPI app
 # =============================================================================
-app = FastAPI(title="Piper TTS GPU (Otimizado com Python)")
+app = FastAPI(title="Piper TTS GPU (Otimizado)")
 
 @app.post("/synthesize", response_class=Response)
 async def synthesize(req: TTSRequest):
@@ -332,7 +335,7 @@ async def synthesize(req: TTSRequest):
     if not synthesis_tasks:
         raise HTTPException(400, "Nenhum texto para sintetizar")
 
-    # Paralelizar sínteses
+    # Paralelizar sínteses (thread pool)
     futures = {}
     for idx, vname, txt, sp, ns, nw in synthesis_tasks:
         pool = voice_pools[vname]
