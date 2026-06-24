@@ -14,6 +14,7 @@ import logging
 import subprocess
 import threading
 import sys
+import glob
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Any
 
@@ -21,6 +22,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
 # =============================================================================
 # Funções auxiliares de diagnóstico
@@ -49,11 +51,6 @@ def find_file(filename: str, search_paths: list = None) -> Optional[str]:
         pass
     return None
 
-def list_files_in_dir(dir_path: str, pattern: str = "*") -> list:
-    """Lista arquivos que batem com o padrão no diretório."""
-    import glob
-    return glob.glob(os.path.join(dir_path, pattern))
-
 # =============================================================================
 # Configuração de logging
 # =============================================================================
@@ -81,8 +78,8 @@ REQUIRED_FILES = {
 
 files_status = {}
 for label, filename in REQUIRED_FILES.items():
-    if '/' in filename and not os.path.isabs(filename):
-        # É só um nome, procura no LD_LIBRARY_PATH
+    if '/' not in filename and not os.path.isabs(filename):
+        # Apenas nome de biblioteca, procurar no LD_LIBRARY_PATH
         found = find_file(filename, os.environ.get("LD_LIBRARY_PATH", "").split(":"))
     elif os.path.isabs(filename):
         found = filename if os.path.isfile(filename) else None
@@ -94,7 +91,7 @@ for label, filename in REQUIRED_FILES.items():
     else:
         logger.critical(f"❌ {label}: NÃO ENCONTRADO")
 
-# Fallback para bibliotecas faltantes: procura em todo o sistema e ajusta LD_LIBRARY_PATH
+# Fallback para bibliotecas faltantes
 missing_libs = [label for label, path in files_status.items() if not path and 'lib' in label.lower()]
 if missing_libs:
     logger.warning("Tentando fallback: busca profunda das libs faltantes...")
@@ -103,8 +100,9 @@ if missing_libs:
         found = find_file(libname)
         if found:
             lib_dir = os.path.dirname(found)
-            if lib_dir not in os.environ.get("LD_LIBRARY_PATH", ""):
-                os.environ["LD_LIBRARY_PATH"] = lib_dir + ":" + os.environ.get("LD_LIBRARY_PATH", "")
+            current_ld = os.environ.get("LD_LIBRARY_PATH", "")
+            if lib_dir not in current_ld:
+                os.environ["LD_LIBRARY_PATH"] = lib_dir + ":" + current_ld
                 logger.warning(f"Adicionado ao LD_LIBRARY_PATH: {lib_dir}")
             files_status[label] = found
             logger.info(f"✅ {label} encontrado em fallback: {found}")
@@ -150,16 +148,11 @@ SYNTHESIS_THREADS = int(os.getenv("SYNTHESIS_THREADS", "8"))
 MIXING_PROCESSES = int(os.getenv("MIXING_PROCESSES", "8"))
 PIPER_POOL_SIZE = int(os.getenv("PIPER_POOL_SIZE", "2"))
 
-# =============================================================================
-# Executores globais
-# =============================================================================
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
-
 synthesis_executor = ThreadPoolExecutor(max_workers=SYNTHESIS_THREADS)
 mixing_executor = ProcessPoolExecutor(max_workers=MIXING_PROCESSES)
 
 # =============================================================================
-# PiperProcess – com captura de stderr e restart
+# PiperProcess
 # =============================================================================
 class PiperProcess:
     def __init__(self, model_path: str, config_path: str, use_cuda: bool = True):
@@ -364,7 +357,7 @@ else:
 logger.info("=" * 70)
 
 # =============================================================================
-# Mixagem isolada (para ProcessPoolExecutor)
+# Função de mixagem para ProcessPoolExecutor
 # =============================================================================
 def mixing_task(ordered_items, ambient_bytes, ambient_volume_db, target_dbfs=-20.0):
     import logging as mix_log
@@ -424,7 +417,7 @@ class TTSRequest(BaseModel):
     speakers: List[SpeakerMapping] = Field(default_factory=list)
 
 # =============================================================================
-# FastAPI
+# FastAPI app
 # =============================================================================
 app = FastAPI(title="Piper TTS API GPU (otimizado + fallback)")
 
@@ -434,7 +427,6 @@ async def synthesize(req: TTSRequest):
     logger.info("=" * 60)
     logger.info(f"Nova requisição: '{req.text[:80]}...'")
 
-    # Parse e mapeamento (idêntico à versão anterior, sem alterações)
     is_dialog = bool(req.speakers)
     if not is_dialog:
         if not req.voice:
@@ -471,7 +463,6 @@ async def synthesize(req: TTSRequest):
         if part in req.effects:
             effect_name = req.effects[part]
             if effect_name not in effect_cache:
-                # Carrega efeito (procura na pasta da voz e global)
                 voice_dir = None
                 if is_dialog and current_role:
                     voice_dir = Path(voices_registry[speaker_map[current_role][0]].model_path).parent
@@ -493,7 +484,6 @@ async def synthesize(req: TTSRequest):
             ordered_items.append({'type': 'effect', 'wav_bytes': effect_cache[effect_name]})
             continue
 
-        # Fala
         if is_dialog:
             if current_role is None:
                 raise HTTPException(400, "Speaker não definido")
@@ -511,7 +501,6 @@ async def synthesize(req: TTSRequest):
     if not synthesis_tasks:
         raise HTTPException(400, "Nenhum texto para sintetizar")
 
-    # Paralelizar sínteses
     futures = {}
     for idx, vname, txt, sp, ns, nw in synthesis_tasks:
         pool = voices_registry[vname]
@@ -523,7 +512,6 @@ async def synthesize(req: TTSRequest):
         ordered_items[idx]['pcm'] = pcm
         ordered_items[idx]['sample_rate'] = sr
 
-    # Ambiente
     ambient_bytes = None
     if req.ambient.enabled and req.ambient.file:
         ambient_path = AMBIENT_DIR / f"{req.ambient.file}.wav"
@@ -532,7 +520,6 @@ async def synthesize(req: TTSRequest):
         with open(ambient_path, "rb") as f:
             ambient_bytes = f.read()
 
-    # Mixagem em processo separado
     loop = asyncio.get_event_loop()
     webm = await loop.run_in_executor(
         mixing_executor,
@@ -546,7 +533,7 @@ async def synthesize(req: TTSRequest):
     logger.info(f"✅ Requisição finalizada em {dur:.2f}s, WebM de {len(webm)} bytes")
     return Response(content=webm, media_type="audio/webm")
 
-# Health checks (inclui status do warm-up e dos arquivos críticos)
+# Health checks
 @app.get("/started")
 async def started():
     return Response(status_code=200, content="started")
