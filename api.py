@@ -1,102 +1,234 @@
-#!/ docs
+#!/usr/bin/env python3
+"""
+Piper TTS API – GPU via piper-tts Python + onnxruntime-gpu
+Arquitetura: pool de sessões ONNX por voz → síntese paralela (threads) → mixagem em processos separados
+"""
+
 import os
 import re
 import io
 import json
 import time
+import queue
 import logging
+import threading
+import asyncio
+import subprocess
 from pathlib import Path
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple, Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
-# Piper imports (da venv)
+# Piper
 from piper import PiperVoice
-from piper.download import ensure_voice_exists, get_voices
 
-logging.basicConfig(level=logging.INFO)
+# =============================================================================
+# Configuração de logging
+# =============================================================================
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
 logger = logging.getLogger("piper-api")
 
+# =============================================================================
+# Função auxiliar para comandos
+# =============================================================================
+def run_cmd(cmd: list, timeout=10):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.stdout + r.stderr
+    except Exception as e:
+        return f"Erro: {e}"
+
+# =============================================================================
+# Diagnóstico inicial
+# =============================================================================
+logger.info("=" * 70)
+logger.info("DIAGNÓSTICO DE AMBIENTE")
+gpu_info = run_cmd(["nvidia-smi"], timeout=5)
+logger.info("nvidia-smi:\n" + gpu_info)
+
+try:
+    import onnxruntime as ort
+    providers = ort.get_available_providers()
+    logger.info(f"ONNX Runtime providers: {providers}")
+    if 'CUDAExecutionProvider' in providers:
+        logger.info("✅ CUDAExecutionProvider disponível – GPU ativa")
+    else:
+        logger.warning("⚠️ CUDAExecutionProvider NÃO encontrado – verifique onnxruntime-gpu")
+except ImportError:
+    logger.error("onnxruntime não instalado!")
+
+logger.info("=" * 70)
+
+# =============================================================================
+# Diretórios e parâmetros
+# =============================================================================
 BASE_DIR = Path("/app")
 VOICES_DIR = BASE_DIR / "voices"
 AMBIENT_DIR = BASE_DIR / "ambient"
 EFFECTS_DIR = BASE_DIR / "effects"
-VOICES_DIR.mkdir(exist_ok=True)
-AMBIENT_DIR.mkdir(exist_ok=True)
-EFFECTS_DIR.mkdir(exist_ok=True)
+for d in (VOICES_DIR, AMBIENT_DIR, EFFECTS_DIR):
+    d.mkdir(exist_ok=True)
 
-# ---------- Carrega vozes (sem pool, usamos sob demanda com lock por voz) ----------
-voice_locks: Dict[str, any] = {}  # Para evitar concorrência, usaremos um lock simples por voz
-voices_models: Dict[str, dict] = {}  # armazena modelo_path e config_path
+SYNTHESIS_THREADS = int(os.getenv("SYNTHESIS_THREADS", "8"))
+MIXING_PROCESSES = int(os.getenv("MIXING_PROCESSES", "8"))
+SESSION_POOL_SIZE = int(os.getenv("SESSION_POOL_SIZE", "2"))
 
-# Função para carregar uma voz (sem instanciar PiperVoice ainda)
-def load_voice_metadata(voice_name: str, voice_path: Path):
-    onnx_files = list(voice_path.glob("*.onnx"))
+synthesis_executor = ThreadPoolExecutor(max_workers=SYNTHESIS_THREADS)
+mixing_executor = ProcessPoolExecutor(max_workers=MIXING_PROCESSES)
+
+logger.info(f"Paralelismo: {SYNTHESIS_THREADS} threads síntese, {MIXING_PROCESSES} processos mixagem, pool={SESSION_POOL_SIZE}")
+
+# =============================================================================
+# Pool de sessões ONNX por voz (thread‑safe)
+# =============================================================================
+class VoiceSessionPool:
+    def __init__(self, model_path: str, config_path: str):
+        self.model_path = model_path
+        self.config_path = config_path
+        self.pool = queue.Queue(maxsize=SESSION_POOL_SIZE)
+        self._init_sessions()
+
+    def _init_sessions(self):
+        for i in range(SESSION_POOL_SIZE):
+            try:
+                voice = PiperVoice.load(self.model_path, config_path=self.config_path, use_cuda=True)
+                self.pool.put(voice)
+                logger.info(f"  → Sessão {i+1}/{SESSION_POOL_SIZE} para {Path(self.model_path).stem}")
+            except Exception as e:
+                logger.error(f"  ✗ Falha ao criar sessão {i+1}: {e}")
+        if self.pool.empty():
+            raise RuntimeError("Nenhuma sessão ONNX pôde ser criada.")
+
+    def synthesize(self, text: str, length_scale: float, noise_scale: float, noise_w_scale: float) -> Tuple[bytes, int]:
+        voice = self.pool.get()
+        try:
+            audio_stream = voice.synthesize(
+                text,
+                length_scale=length_scale,
+                noise_scale=noise_scale,
+                noise_w=noise_w_scale
+            )
+            pcm = b''.join(chunk.audio_int16_bytes for chunk in audio_stream)
+            sample_rate = voice.config.sample_rate
+            return pcm, sample_rate
+        finally:
+            self.pool.put(voice)
+
+# =============================================================================
+# Carregamento das vozes
+# =============================================================================
+voice_pools: Dict[str, VoiceSessionPool] = {}
+
+def load_voice(voice_name: str, voice_dir: Path):
+    onnx_files = list(voice_dir.glob("*.onnx"))
     if not onnx_files:
-        raise FileNotFoundError(f"Nenhum .onnx em {voice_path}")
+        raise FileNotFoundError(f"Nenhum .onnx em {voice_dir}")
     model_path = str(onnx_files[0])
-    json_path = voice_path / f"{onnx_files[0].stem}.onnx.json"
+    json_path = voice_dir / f"{onnx_files[0].stem}.onnx.json"
     if not json_path.exists():
-        json_candidates = list(voice_path.glob("*.json"))
+        json_candidates = list(voice_dir.glob("*.json"))
         if not json_candidates:
             raise FileNotFoundError(f"Nenhum .json para {voice_name}")
         json_path = json_candidates[0]
     config_path = str(json_path)
-    voices_models[voice_name] = {"model_path": model_path, "config_path": config_path}
-    voice_locks[voice_name] = threading.Lock()  # thread lock
-    logger.info(f"✅ Metadados da voz {voice_name} carregados")
+    logger.info(f"Carregando voz {voice_name} (pool de {SESSION_POOL_SIZE} sessões)")
+    pool = VoiceSessionPool(model_path, config_path)
+    voice_pools[voice_name] = pool
+    logger.info(f"✅ Voz {voice_name} pronta (GPU)")
 
 for item in VOICES_DIR.iterdir():
     if item.is_dir():
         try:
-            load_voice_metadata(item.name, item)
+            load_voice(item.name, item)
         except Exception as e:
             logger.error(f"❌ {item.name}: {e}")
 
 for onnx_file in VOICES_DIR.glob("*.onnx"):
     voice_name = onnx_file.stem
-    if voice_name not in voices_models:
-        json_file = onnx_file.with_suffix(".onnx.json")
-        if json_file.exists():
-            try:
-                load_voice_metadata(voice_name, VOICES_DIR)
-            except Exception as e:
-                logger.error(f"❌ {voice_name}: {e}")
+    if voice_name in voice_pools:
+        continue
+    json_file = onnx_file.with_suffix(".onnx.json")
+    if json_file.exists():
+        try:
+            load_voice(voice_name, VOICES_DIR)
+        except Exception as e:
+            logger.error(f"❌ {voice_name}: {e}")
 
-logger.info(f"Total de vozes: {len(voices_models)}")
+logger.info(f"Total de vozes carregadas: {len(voice_pools)}")
+MODEL_LOADED = len(voice_pools) > 0
 
-# ---------- Função de síntese (cria uma sessão por chamada, com lock para evitar concorrência) ----------
-import threading
+# =============================================================================
+# WARM-UP
+# =============================================================================
+logger.info("=" * 70)
+logger.info("🔥 WARM-UP")
+warmup_success = False
+if "faber" in voice_pools:
+    try:
+        pcm, sr = voice_pools["faber"].synthesize("Teste de aquecimento", 1.0, 0.667, 0.8)
+        seg = AudioSegment(data=pcm, sample_width=2, frame_rate=sr, channels=1)
+        if sr != 22050:
+            seg = seg.set_frame_rate(22050)
+        buf = io.BytesIO()
+        seg.export(buf, format="webm", codec="libopus", parameters=["-b:a", "64k"])
+        warmup_success = True
+        logger.info(f"✅ Warm-up OK – WebM de {buf.tell()} bytes")
+    except Exception as e:
+        logger.critical(f"❌ Warm-up falhou: {e}")
+else:
+    logger.warning("Voz 'faber' não encontrada, warm-up ignorado.")
+logger.info("=" * 70)
 
-def synthesize_text(voice_name: str, text: str, length_scale: float, noise_scale: float, noise_w_scale: float):
-    if voice_name not in voices_models:
-        raise ValueError(f"Voz {voice_name} não encontrada")
-    lock = voice_locks[voice_name]
-    with lock:
-        # Carrega o modelo (cached? na verdade, recarrega a cada vez; para performance, seria melhor cachear a sessão,
-        # mas a sessão ONNX não é thread-safe. Para simplificar e evitar problemas de GPU, criamos uma nova a cada chamada.)
-        voice = PiperVoice.load(
-            voices_models[voice_name]["model_path"],
-            config_path=voices_models[voice_name]["config_path"],
-            use_cuda=True   # <--- GPU ATIVADA
-        )
-        # Sintetiza
-        audio_stream = voice.synthesize(
-            text,
-            length_scale=length_scale,
-            noise_scale=noise_scale,
-            noise_w=noise_w_scale
-        )
-        # Concatena os chunks de áudio
-        pcm_bytes = b''.join(audio_chunk.audio_int16_bytes for audio_chunk in audio_stream)
-        sample_rate = voice.config.sample_rate
-        del voice  # libera memória GPU
-    return pcm_bytes, sample_rate
+# =============================================================================
+# Função de mixagem (para ProcessPoolExecutor)
+# =============================================================================
+def mixing_task(ordered_items, ambient_bytes, ambient_volume_db, target_dbfs=-20.0):
+    import logging as mix_log
+    mix_log.basicConfig(level=logging.INFO)
+    log = mix_log.getLogger("mixing")
+    log.info(f"Mixando {len(ordered_items)} itens")
+    audio_chunks = []
+    for item in ordered_items:
+        if item['type'] == 'speech':
+            seg = AudioSegment(data=item['pcm'], sample_width=2, frame_rate=item['sample_rate'], channels=1)
+            if item['sample_rate'] != 22050:
+                seg = seg.set_frame_rate(22050)
+            audio_chunks.append(seg)
+        elif item['type'] == 'effect':
+            seg = AudioSegment.from_wav(io.BytesIO(item['wav_bytes']))
+            if seg.frame_rate != 22050:
+                seg = seg.set_frame_rate(22050)
+            audio_chunks.append(seg)
+    if not audio_chunks:
+        raise ValueError("Nenhum áudio para mixar")
+    combined = sum(audio_chunks, AudioSegment.empty())
+    if combined.dBFS != target_dbfs:
+        combined = combined.apply_gain(target_dbfs - combined.dBFS)
+    if ambient_bytes:
+        ambient = AudioSegment.from_wav(io.BytesIO(ambient_bytes))
+        if ambient.frame_rate != combined.frame_rate:
+            ambient = ambient.set_frame_rate(combined.frame_rate)
+        if len(ambient) < len(combined):
+            ambient = ambient * (len(combined) // len(ambient) + 1)
+        ambient = ambient[:len(combined)]
+        combined = combined.overlay(ambient)
+    buf = io.BytesIO()
+    combined.export(buf, format="webm", codec="libopus", parameters=["-b:a", "64k"])
+    log.info(f"Mixagem concluída: {buf.tell()} bytes")
+    return buf.getvalue()
 
-# ---------- Modelos de requisição (mesmos de antes) ----------
+# =============================================================================
+# Modelos Pydantic
+# =============================================================================
 class AmbientConfig(BaseModel):
     enabled: bool = False
     file: Optional[str] = None
@@ -119,8 +251,10 @@ class TTSRequest(BaseModel):
     ambient: AmbientConfig = Field(default_factory=AmbientConfig)
     speakers: List[SpeakerMapping] = Field(default_factory=list)
 
-# ---------- FastAPI ----------
-app = FastAPI(title="Piper TTS GPU (Python)")
+# =============================================================================
+# FastAPI app
+# =============================================================================
+app = FastAPI(title="Piper TTS GPU (Otimizado com Python)")
 
 @app.post("/synthesize", response_class=Response)
 async def synthesize(req: TTSRequest):
@@ -128,12 +262,11 @@ async def synthesize(req: TTSRequest):
     logger.info("=" * 60)
     logger.info(f"Nova requisição: '{req.text[:80]}...'")
 
-    # Lógica de diálogo (idêntica à anterior)
     is_dialog = bool(req.speakers)
     if not is_dialog:
         if not req.voice:
             raise HTTPException(400, "Campo 'voice' obrigatório")
-        if req.voice not in voices_models:
+        if req.voice not in voice_pools:
             raise HTTPException(404, f"Voz '{req.voice}' não encontrada")
         speaker_map = {None: (req.voice, req.speed, req.noise_scale, req.noise_w_scale)}
         current_role = None
@@ -144,12 +277,14 @@ async def synthesize(req: TTSRequest):
             nw = spk.noise_w_scale if spk.noise_w_scale is not None else req.noise_w_scale
             speaker_map[spk.role] = (spk.voice, spk.speed, ns, nw)
         for role, (v, _, _, _) in speaker_map.items():
-            if v not in voices_models:
+            if v not in voice_pools:
                 raise HTTPException(404, f"Voz '{v}' do speaker '{role}' não encontrada")
         current_role = None
 
     parts = re.split(r'(\[.*?\])', req.text)
-    audio_chunks = []
+    ordered_items = []
+    synthesis_tasks = []
+    effect_cache = {}
 
     for part in parts:
         part = part.strip()
@@ -161,20 +296,22 @@ async def synthesize(req: TTSRequest):
                 current_role = role
             continue
         if part in req.effects:
-            # Efeitos (mesmo código)
             effect_name = req.effects[part]
-            voice_name_eff = speaker_map[current_role][0] if is_dialog and current_role else req.voice
-            effect_path = None
-            voice_dir = Path(voices_models[voice_name_eff]["model_path"]).parent
-            candidate = voice_dir / effect_name
-            if candidate.exists(): effect_path = candidate
-            if not effect_path: candidate = EFFECTS_DIR / effect_name
-            if candidate.exists(): effect_path = candidate
-            if not effect_path:
-                raise HTTPException(404, f"Efeito '{effect_name}' não encontrado")
-            seg = AudioSegment.from_wav(str(effect_path))
-            if seg.frame_rate != 22050: seg = seg.set_frame_rate(22050)
-            audio_chunks.append(seg)
+            if effect_name not in effect_cache:
+                voice_name_eff = speaker_map[current_role][0] if is_dialog and current_role else req.voice
+                voice_dir = Path(voice_pools[voice_name_eff].model_path).parent
+                effect_path = None
+                if (voice_dir / effect_name).exists():
+                    effect_path = voice_dir / effect_name
+                else:
+                    candidate = EFFECTS_DIR / effect_name
+                    if candidate.exists():
+                        effect_path = candidate
+                if not effect_path:
+                    raise HTTPException(404, f"Efeito '{effect_name}' não encontrado")
+                with open(effect_path, "rb") as f:
+                    effect_cache[effect_name] = f.read()
+            ordered_items.append({'type': 'effect', 'wav_bytes': effect_cache[effect_name]})
             continue
 
         # Fala
@@ -188,50 +325,67 @@ async def synthesize(req: TTSRequest):
             noise_s = req.noise_scale
             noise_w = req.noise_w_scale
 
-        try:
-            pcm, sr = synthesize_text(voice_name, part, speed, noise_s, noise_w)
-            seg = AudioSegment(data=pcm, sample_width=2, frame_rate=sr, channels=1)
-            if sr != 22050: seg = seg.set_frame_rate(22050)
-            audio_chunks.append(seg)
-        except Exception as e:
-            logger.error(f"Erro na síntese: {e}")
-            raise HTTPException(500, f"Erro na voz {voice_name}: {e}")
+        idx = len(ordered_items)
+        ordered_items.append({'type': 'speech', 'pcm': None, 'sample_rate': None})
+        synthesis_tasks.append((idx, voice_name, part, speed, noise_s, noise_w))
 
-    if not audio_chunks:
-        raise HTTPException(400, "Nenhum áudio gerado")
+    if not synthesis_tasks:
+        raise HTTPException(400, "Nenhum texto para sintetizar")
 
-    combined = sum(audio_chunks, AudioSegment.empty())
-    target_dBFS = -20.0
-    if combined.dBFS != target_dBFS:
-        combined = combined.apply_gain(target_dBFS - combined.dBFS)
+    # Paralelizar sínteses
+    futures = {}
+    for idx, vname, txt, sp, ns, nw in synthesis_tasks:
+        pool = voice_pools[vname]
+        fut = synthesis_executor.submit(pool.synthesize, txt, sp, ns, nw)
+        futures[fut] = idx
+    for fut in as_completed(futures):
+        idx = futures[fut]
+        pcm, sr = fut.result()
+        ordered_items[idx]['pcm'] = pcm
+        ordered_items[idx]['sample_rate'] = sr
 
+    # Ambiente
+    ambient_bytes = None
     if req.ambient.enabled and req.ambient.file:
         ambient_path = AMBIENT_DIR / f"{req.ambient.file}.wav"
         if not ambient_path.exists():
-            raise HTTPException(404, f"Ambiente não encontrado")
-        ambient = AudioSegment.from_wav(str(ambient_path))
-        if ambient.frame_rate != combined.frame_rate:
-            ambient = ambient.set_frame_rate(combined.frame_rate)
-        if len(ambient) < len(combined):
-            ambient = ambient * (len(combined) // len(ambient) + 1)
-        ambient = ambient[:len(combined)]
-        combined = combined.overlay(ambient)
+            raise HTTPException(404, f"Ambiente '{req.ambient.file}' não encontrado")
+        with open(ambient_path, "rb") as f:
+            ambient_bytes = f.read()
 
-    buf = io.BytesIO()
-    combined.export(buf, format="webm", codec="libopus", parameters=["-b:a", "64k"])
+    # Mixagem em processo separado (libera GPU)
+    loop = asyncio.get_event_loop()
+    webm = await loop.run_in_executor(
+        mixing_executor,
+        mixing_task,
+        ordered_items,
+        ambient_bytes,
+        req.ambient.volume_db
+    )
+
     dur = time.perf_counter() - inicio
-    logger.info(f"✅ Finalizado em {dur:.2f}s, WebM de {buf.tell()} bytes")
-    return Response(content=buf.getvalue(), media_type="audio/webm")
+    logger.info(f"✅ Requisição finalizada em {dur:.2f}s, WebM de {len(webm)} bytes")
+    return Response(content=webm, media_type="audio/webm")
 
 # Health checks
 @app.get("/started")
 async def started(): return Response(status_code=200, content="started")
 @app.get("/ready")
 async def ready():
-    if voices_models: return Response(status_code=200, content="ready")
+    if MODEL_LOADED: return Response(status_code=200, content="ready")
     return Response(status_code=503, content="loading model")
 @app.get("/live")
 async def live(): return Response(status_code=200, content="alive")
 @app.get("/health")
 async def health():
-    return {"status": "ok", "gpu": True, "voices": list(voices_models.keys())}
+    return {
+        "status": "ok",
+        "gpu": True,
+        "warmup": warmup_success,
+        "voices_loaded": list(voice_pools.keys()),
+        "total_voices": len(voice_pools)
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
