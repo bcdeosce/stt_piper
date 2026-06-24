@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Piper TTS API – GPU via binário compilado
-Arquitetura otimizada + diagnóstico + fallback de bibliotecas
+Leitura de saída no formato WAV (stdout) – sem mistura texto/binário
 """
 
 import os
@@ -10,11 +10,10 @@ import io
 import json
 import time
 import queue
+import struct
 import logging
 import subprocess
 import threading
-import sys
-import glob
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Any
 
@@ -25,7 +24,7 @@ from pydub import AudioSegment
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
 # =============================================================================
-# Funções auxiliares de diagnóstico
+# Funções auxiliares
 # =============================================================================
 def run_cmd(cmd: list, timeout: int = 10) -> str:
     try:
@@ -35,13 +34,11 @@ def run_cmd(cmd: list, timeout: int = 10) -> str:
         return f"Erro: {e}"
 
 def find_file(filename: str, search_paths: list = None) -> Optional[str]:
-    """Procura um arquivo nos paths fornecidos ou em todo o container."""
     if search_paths:
         for p in search_paths:
             full = os.path.join(p, filename)
             if os.path.isfile(full):
                 return full
-    # Fallback: usa find (pode demorar)
     try:
         res = subprocess.run(["find", "/", "-name", filename, "-type", "f"],
                              capture_output=True, text=True, timeout=20)
@@ -50,6 +47,40 @@ def find_file(filename: str, search_paths: list = None) -> Optional[str]:
     except:
         pass
     return None
+
+def read_wav_from_stream(stream) -> Tuple[bytes, int, int, int]:
+    """
+    Lê um arquivo WAV de um stream binário e retorna:
+    (pcm_data, sample_rate, num_channels, sample_width_bytes)
+    """
+    # Lê cabeçalho RIFF (12 bytes)
+    riff = stream.read(12)
+    if len(riff) < 12 or riff[:4] != b'RIFF':
+        raise ValueError("WAV inválido: cabeçalho RIFF ausente")
+    # Lê chunks até encontrar 'fmt ' e 'data'
+    fmt_data = b''
+    data_chunk = b''
+    while True:
+        chunk_id = stream.read(4)
+        if not chunk_id:
+            break
+        chunk_size = struct.unpack('<I', stream.read(4))[0]
+        chunk_data = stream.read(chunk_size)
+        if chunk_id == b'fmt ':
+            fmt_data = chunk_data
+        elif chunk_id == b'data':
+            data_chunk = chunk_data
+            # Podemos parar após ler data, mas precisamos processar o fmt
+            if fmt_data:
+                break
+    if not fmt_data or not data_chunk:
+        raise ValueError("WAV incompleto: chunks fmt ou data faltando")
+    # Parse fmt
+    audio_format, num_channels, sample_rate, _, _, bits_per_sample = struct.unpack('<HHIIHH', fmt_data[:16])
+    if audio_format != 1:  # PCM linear
+        raise ValueError("WAV não é PCM linear")
+    sample_width = bits_per_sample // 8
+    return data_chunk, sample_rate, num_channels, sample_width
 
 # =============================================================================
 # Configuração de logging
@@ -63,7 +94,7 @@ logging.basicConfig(
 logger = logging.getLogger("piper-api")
 
 # =============================================================================
-# DIAGNÓSTICO INICIAL DO AMBIENTE
+# DIAGNÓSTICO INICIAL
 # =============================================================================
 logger.info("=" * 70)
 logger.info("DIAGNÓSTICO DE ARQUIVOS E BIBLIOTECAS")
@@ -79,7 +110,6 @@ REQUIRED_FILES = {
 files_status = {}
 for label, filename in REQUIRED_FILES.items():
     if '/' not in filename and not os.path.isabs(filename):
-        # Apenas nome de biblioteca, procurar no LD_LIBRARY_PATH
         found = find_file(filename, os.environ.get("LD_LIBRARY_PATH", "").split(":"))
     elif os.path.isabs(filename):
         found = filename if os.path.isfile(filename) else None
@@ -91,7 +121,7 @@ for label, filename in REQUIRED_FILES.items():
     else:
         logger.critical(f"❌ {label}: NÃO ENCONTRADO")
 
-# Fallback para bibliotecas faltantes
+# Fallback de bibliotecas
 missing_libs = [label for label, path in files_status.items() if not path and 'lib' in label.lower()]
 if missing_libs:
     logger.warning("Tentando fallback: busca profunda das libs faltantes...")
@@ -109,29 +139,26 @@ if missing_libs:
         else:
             logger.critical(f"❌ {label} não encontrado mesmo após busca geral.")
 
-# Lista de modelos de voz e seus arquivos
+# Modelos de voz
 voice_model_files = []
 for item in Path("/app/voices").rglob("*.onnx"):
     voice_model_files.append(str(item))
 for item in Path("/app/voices").rglob("*.onnx.json"):
     voice_model_files.append(str(item))
-
 logger.info(f"Modelos de voz encontrados: {len(voice_model_files)} arquivos")
-if voice_model_files:
-    logger.debug("Arquivos: " + "\n".join(voice_model_files[:10]))
 
-# Status da GPU
+# GPU
 gpu_info = run_cmd(["nvidia-smi"], timeout=5)
 logger.info("GPU info:\n" + gpu_info)
 
-# Verificação do piper
+# Piper help
 piper_help = run_cmd(["/app/piper-bin", "--help"], timeout=5)
 logger.info("piper --help (primeiras linhas):\n" + piper_help[:500])
 
 logger.info("=" * 70)
 
 # =============================================================================
-# Diretórios
+# Diretórios e configurações
 # =============================================================================
 BASE_DIR = Path("/app")
 VOICES_DIR = BASE_DIR / "voices"
@@ -141,9 +168,6 @@ EFFECTS_DIR = BASE_DIR / "effects"
 for d in (VOICES_DIR, AMBIENT_DIR, EFFECTS_DIR):
     d.mkdir(exist_ok=True)
 
-# =============================================================================
-# Paralelismo
-# =============================================================================
 SYNTHESIS_THREADS = int(os.getenv("SYNTHESIS_THREADS", "8"))
 MIXING_PROCESSES = int(os.getenv("MIXING_PROCESSES", "8"))
 PIPER_POOL_SIZE = int(os.getenv("PIPER_POOL_SIZE", "2"))
@@ -152,7 +176,7 @@ synthesis_executor = ThreadPoolExecutor(max_workers=SYNTHESIS_THREADS)
 mixing_executor = ProcessPoolExecutor(max_workers=MIXING_PROCESSES)
 
 # =============================================================================
-# PiperProcess
+# PiperProcess com saída WAV no stdout
 # =============================================================================
 class PiperProcess:
     def __init__(self, model_path: str, config_path: str, use_cuda: bool = True):
@@ -171,7 +195,7 @@ class PiperProcess:
             "--model", self.model_path,
             "--config", self.config_path,
             "--json-input",
-            "--output-raw"
+            "--output-dir", "-"      # stdout como arquivo WAV
         ]
         if self.use_cuda:
             cmd.append("--cuda")
@@ -199,7 +223,7 @@ class PiperProcess:
             logger.error(f"[PIPER] Processo morreu na inicialização. stderr: {stderr_tail[-500:]}")
             raise RuntimeError(f"Piper morreu ao iniciar. stderr: {stderr_tail[-200:]}")
 
-        logger.info(f"[PIPER] Pronto (PID {self.process.pid}) para modelo {Path(self.model_path).name}")
+        logger.info(f"[PIPER] Pronto (PID {self.process.pid}) para {Path(self.model_path).name}")
 
     def _read_stderr(self):
         for line in iter(self.process.stderr.readline, b''):
@@ -212,6 +236,10 @@ class PiperProcess:
 
     def synthesize(self, text: str, length_scale: float = 1.0,
                    noise_scale: float = 0.667, noise_w_scale: float = 0.8) -> Tuple[bytes, int]:
+        """
+        Envia requisição JSON e lê o arquivo WAV retornado.
+        Retorna (pcm_bytes, sample_rate).
+        """
         request = {
             "text": text,
             "length_scale": length_scale,
@@ -223,21 +251,13 @@ class PiperProcess:
                 self.process.stdin.write((json.dumps(request) + "\n").encode())
                 self.process.stdin.flush()
 
-                line = self.process.stdout.readline()
-                if not line:
-                    stderr_tail = self._get_stderr_tail()
-                    logger.error(f"[PIPER] Processo morreu. stderr: {stderr_tail[-500:]}")
-                    raise RuntimeError(f"Processo piper morreu (stdout vazio). stderr: {stderr_tail[-200:]}")
-
-                response = json.loads(line)
-                num_samples = response.get("num_samples", 0)
-                sample_rate = response.get("sample_rate", 22050)
-                raw_audio = self.process.stdout.read(num_samples * 2)
-
-                if len(raw_audio) != num_samples * 2:
-                    logger.warning(f"[PIPER] Tamanho de áudio inesperado: esperado {num_samples*2}, recebido {len(raw_audio)}")
-
-                return raw_audio, sample_rate
+                # Lê o WAV completo do stdout
+                pcm_data, sample_rate, num_channels, sample_width = read_wav_from_stream(self.process.stdout)
+                # Garantir mono (se não for, mixamos para mono – mas o Piper sempre gera mono)
+                if num_channels > 1:
+                    # Converte para mono usando pydub (faremos na camada superior)
+                    pass
+                return pcm_data, sample_rate
 
             except (json.JSONDecodeError, KeyError) as e:
                 stderr_tail = self._get_stderr_tail()
@@ -296,7 +316,6 @@ def load_voice_from_folder(voice_name: str, voice_path: Path) -> PiperProcessPoo
     if not onnx_files:
         raise FileNotFoundError(f"Nenhum .onnx em {voice_path}")
     model_path = str(onnx_files[0])
-
     json_path = voice_path / f"{onnx_files[0].stem}.onnx.json"
     if not json_path.exists():
         json_candidates = list(voice_path.glob("*.json"))
@@ -304,7 +323,6 @@ def load_voice_from_folder(voice_name: str, voice_path: Path) -> PiperProcessPoo
             raise FileNotFoundError(f"Nenhum .json para {voice_name}")
         json_path = json_candidates[0]
     config_path = str(json_path)
-
     logger.info(f"Carregando voz {voice_name} (pool size={PIPER_POOL_SIZE})")
     pool = PiperProcessPool(model_path, config_path, pool_size=PIPER_POOL_SIZE)
     logger.info(f"✅ Voz {voice_name} pronta (GPU)")
@@ -333,7 +351,7 @@ logger.info(f"Total de vozes carregadas: {len(voices_registry)}")
 MODEL_LOADED = len(voices_registry) > 0
 
 # =============================================================================
-# WARM-UP com voz faber
+# WARM-UP
 # =============================================================================
 logger.info("=" * 70)
 logger.info("🔥 WARM-UP")
@@ -357,7 +375,7 @@ else:
 logger.info("=" * 70)
 
 # =============================================================================
-# Função de mixagem para ProcessPoolExecutor
+# Mixagem para ProcessPoolExecutor
 # =============================================================================
 def mixing_task(ordered_items, ambient_bytes, ambient_volume_db, target_dbfs=-20.0):
     import logging as mix_log
@@ -407,7 +425,7 @@ class SpeakerMapping(BaseModel):
     noise_w_scale: Optional[float] = Field(default=None, ge=0.0, le=2.0)
 
 class TTSRequest(BaseModel):
-    voice: Optional[str] = Field(None, description="Nome da voz (modo único)")
+    voice: Optional[str] = Field(None)
     text: str = Field(..., min_length=1)
     speed: float = Field(default=1.0, ge=0.5, le=2.0)
     noise_scale: float = Field(default=0.667, ge=0.0, le=1.5)
@@ -419,7 +437,7 @@ class TTSRequest(BaseModel):
 # =============================================================================
 # FastAPI app
 # =============================================================================
-app = FastAPI(title="Piper TTS API GPU (otimizado + fallback)")
+app = FastAPI(title="Piper TTS API GPU (WAV stdout)")
 
 @app.post("/synthesize", response_class=Response)
 async def synthesize(req: TTSRequest):
