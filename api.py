@@ -13,6 +13,7 @@ import queue
 import logging
 import asyncio
 import subprocess
+import sys
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Any
 
@@ -22,7 +23,33 @@ from pydantic import BaseModel, Field
 from pydub import AudioSegment
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
-# Piper – APENAS PiperVoice (não existe SynthesisConfig)
+# =============================================================================
+# Verificação e instalação automática do onnxruntime-gpu (se necessário)
+# =============================================================================
+def ensure_gpu_onnx():
+    try:
+        import onnxruntime as ort
+        if 'CUDAExecutionProvider' in ort.get_available_providers():
+            return True
+    except ImportError:
+        pass
+
+    logging.warning("CUDAExecutionProvider não encontrado. Tentando instalar onnxruntime-gpu...")
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir", "onnxruntime-gpu==1.14.1"])
+        import onnxruntime as ort
+        if 'CUDAExecutionProvider' in ort.get_available_providers():
+            logging.info("✅ onnxruntime-gpu instalado com sucesso!")
+            return True
+    except Exception as e:
+        logging.error(f"Falha ao instalar onnxruntime-gpu: {e}")
+    return False
+
+# Aguarda um pouco para garantir que a rede está disponível
+time.sleep(2)
+GPU_ACTIVE = ensure_gpu_onnx()
+
+# Agora importa o PiperVoice (que depende do onnxruntime)
 from piper import PiperVoice
 
 # =============================================================================
@@ -67,7 +94,7 @@ except ImportError:
 logger.info("=" * 70)
 
 # =============================================================================
-# Diretórios e parâmetros de paralelismo
+# Diretórios e parâmetros
 # =============================================================================
 BASE_DIR = Path("/app")
 VOICES_DIR = BASE_DIR / "voices"
@@ -85,7 +112,7 @@ mixing_executor = ProcessPoolExecutor(max_workers=MIXING_PROCESSES)
 logger.info(f"Paralelismo: {SYNTHESIS_THREADS} threads síntese, {MIXING_PROCESSES} processos mixagem, pool={SESSION_POOL_SIZE}")
 
 # =============================================================================
-# Pool de sessões ONNX por voz (thread‑safe, chamada direta sem SynthesisConfig)
+# Pool de sessões ONNX por voz
 # =============================================================================
 class VoiceSessionPool:
     def __init__(self, model_path: str, config_path: str):
@@ -100,7 +127,7 @@ class VoiceSessionPool:
                 voice = PiperVoice.load(
                     self.model_path,
                     config_path=self.config_path,
-                    use_cuda=True
+                    use_cuda=GPU_ACTIVE  # usa a variável global
                 )
                 self.pool.put(voice)
                 logger.info(f"  → Sessão {i+1}/{SESSION_POOL_SIZE} para {Path(self.model_path).stem}")
@@ -112,13 +139,12 @@ class VoiceSessionPool:
     def synthesize(self, text: str, length_scale: float, noise_scale: float, noise_w_scale: float) -> Tuple[bytes, int]:
         voice = self.pool.get()
         try:
-            # Chamada direta com parâmetros (API oficial piper 1.2.0)
+            # Chamada sem volume e sem SynthesisConfig
             audio_stream = voice.synthesize(
                 text,
                 length_scale=length_scale,
                 noise_scale=noise_scale,
-                noise_w=noise_w_scale,
-                volume=1.0
+                noise_w=noise_w_scale
             )
             pcm = b''.join(chunk.audio_int16_bytes for chunk in audio_stream)
             sample_rate = voice.config.sample_rate
@@ -146,7 +172,7 @@ def load_voice(voice_name: str, voice_dir: Path):
     logger.info(f"Carregando voz {voice_name} (pool de {SESSION_POOL_SIZE} sessões)")
     pool = VoiceSessionPool(model_path, config_path)
     voice_pools[voice_name] = pool
-    logger.info(f"✅ Voz {voice_name} pronta (GPU)")
+    logger.info(f"✅ Voz {voice_name} pronta (GPU={GPU_ACTIVE})")
 
 for item in VOICES_DIR.iterdir():
     if item.is_dir():
@@ -335,7 +361,7 @@ async def synthesize(req: TTSRequest):
     if not synthesis_tasks:
         raise HTTPException(400, "Nenhum texto para sintetizar")
 
-    # Paralelizar sínteses (thread pool)
+    # Paralelizar sínteses
     futures = {}
     for idx, vname, txt, sp, ns, nw in synthesis_tasks:
         pool = voice_pools[vname]
@@ -356,7 +382,7 @@ async def synthesize(req: TTSRequest):
         with open(ambient_path, "rb") as f:
             ambient_bytes = f.read()
 
-    # Mixagem em processo separado (libera GPU)
+    # Mixagem em processo separado
     loop = asyncio.get_event_loop()
     webm = await loop.run_in_executor(
         mixing_executor,
@@ -383,7 +409,7 @@ async def live(): return Response(status_code=200, content="alive")
 async def health():
     return {
         "status": "ok",
-        "gpu": True,
+        "gpu": GPU_ACTIVE,
         "warmup": warmup_success,
         "voices_loaded": list(voice_pools.keys()),
         "total_voices": len(voice_pools)
