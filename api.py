@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Iterable
 from concurrent.futures import ThreadPoolExecutor
 
-import numpy as np
+# --- Única dependência segura sem instalação extra ---
 from pydub import AudioSegment
 
 # ---------- Configuração de logs ----------
@@ -26,7 +26,7 @@ GPU_WORKERS = 2
 MIX_WORKERS = 10
 SAMPLE_RATE_TARGET = 22050
 
-# ---------- Directórios ----------
+# ---------- Diretórios ----------
 BASE_DIR = Path("/app")
 VOICES_DIR = BASE_DIR / "voices"
 AMBIENT_DIR = BASE_DIR / "ambient"
@@ -35,21 +35,30 @@ VOICES_DIR.mkdir(exist_ok=True)
 AMBIENT_DIR.mkdir(exist_ok=True)
 EFFECTS_DIR.mkdir(exist_ok=True)
 
-# ---------- Referências atrasadas (preenchidas após instalação) ----------
+# ---------- Referências atrasadas (preenchidas no startup) ----------
+_np = None
 _onnxruntime = None
 
+def get_np():
+    """Retorna o módulo numpy, já instalado e importado."""
+    if _np is None:
+        raise RuntimeError("numpy ainda não foi inicializado")
+    return _np
+
 def get_ort():
+    """Retorna o módulo onnxruntime, já instalado e importado."""
     if _onnxruntime is None:
-        raise RuntimeError("onnxruntime não inicializado")
+        raise RuntimeError("onnxruntime ainda não foi inicializado")
     return _onnxruntime
 
-# ---------- Tokens especiais (definidos no piper original) ----------
+# ---------- Tokens especiais (piper original) ----------
 BOS = "^"
 EOS = "$"
 PAD = "_"
 
-def audio_float_to_int16(audio: np.ndarray) -> np.ndarray:
-    """Converte float [-1,1] para int16, igual ao piper original."""
+def audio_float_to_int16(audio: "np.ndarray") -> "np.ndarray":
+    """Converte float [-1,1] para int16, idêntico ao piper original."""
+    np = get_np()
     max_int16 = np.iinfo(np.int16).max
     audio = np.clip(audio, -1, 1) * max_int16
     return audio.astype(np.int16)
@@ -57,10 +66,9 @@ def audio_float_to_int16(audio: np.ndarray) -> np.ndarray:
 # ---------- Classe PiperVoice personalizada (usa GPU directamente) ----------
 class CustomPiperVoice:
     def __init__(self, model_path: str, config_path: str, use_cuda: bool = True):
-        # Carrega config
         with open(config_path, "r", encoding="utf-8") as f:
             self.config = json.load(f)
-        # Carrega sessão ONNX com provider GPU ou CPU
+
         ort = get_ort()
         providers = ["CUDAExecutionProvider"] if use_cuda else ["CPUExecutionProvider"]
         self.session = ort.InferenceSession(
@@ -68,6 +76,7 @@ class CustomPiperVoice:
             sess_options=ort.SessionOptions(),
             providers=providers
         )
+
         self.sample_rate = self.config["audio"]["sample_rate"]
         self.phoneme_type = self.config["phoneme_type"]
         self.id_map = self.config["phoneme_id_map"]
@@ -78,12 +87,9 @@ class CustomPiperVoice:
         self.espeak_voice = self.config.get("espeak", {}).get("voice", "en")
 
     def phonemize(self, text: str) -> List[List[str]]:
-        """Converte texto para lista de fonemas por frase, igual ao piper original."""
-        # Importa piper_phonemize (já está instalado na imagem base)
         from piper_phonemize import phonemize_espeak, phonemize_codepoints, tashkeel_run
         if self.phoneme_type == "espeak":
             if self.espeak_voice == "ar":
-                # Suporte a árabe
                 text = tashkeel_run(text)
             return phonemize_espeak(text, self.espeak_voice)
         elif self.phoneme_type == "text":
@@ -92,7 +98,6 @@ class CustomPiperVoice:
             raise ValueError(f"Tipo de fonema inesperado: {self.phoneme_type}")
 
     def phonemes_to_ids(self, phonemes: List[str]) -> List[int]:
-        """Converte fonemas para ids, adicionando tokens especiais."""
         ids = [self.id_map[BOS]]
         for p in phonemes:
             if p not in self.id_map:
@@ -111,7 +116,7 @@ class CustomPiperVoice:
         noise_scale: Optional[float] = None,
         noise_w: Optional[float] = None,
     ) -> bytes:
-        """Sintetiza áudio cru (bytes int16) a partir de IDs."""
+        np = get_np()
         length_scale = length_scale if length_scale is not None else self.length_scale
         noise_scale = noise_scale if noise_scale is not None else self.noise_scale
         noise_w = noise_w if noise_w is not None else self.noise_w
@@ -144,10 +149,9 @@ class CustomPiperVoice:
         noise_w: Optional[float] = None,
         sentence_silence: float = 0.0,
     ) -> Iterable[bytes]:
-        """Sintetiza texto e retorna gerador de chunks de áudio (int16)."""
         sentence_phonemes = self.phonemize(text)
         num_silence_samples = int(sentence_silence * self.sample_rate)
-        silence_bytes = bytes(num_silence_samples * 2)  # 16-bit mono
+        silence_bytes = bytes(num_silence_samples * 2)
 
         for phonemes in sentence_phonemes:
             ids = self.phonemes_to_ids(phonemes)
@@ -167,7 +171,6 @@ class CustomPiperVoice:
         noise_w: float = 0.8,
         sentence_silence: float = 0.0,
     ) -> AudioSegment:
-        """Sintetiza texto e retorna um AudioSegment do pydub."""
         raw_bytes = b''.join(self.synthesize(
             text,
             length_scale=length_scale,
@@ -177,7 +180,7 @@ class CustomPiperVoice:
         ))
         seg = AudioSegment(
             data=raw_bytes,
-            sample_width=2,        # 16-bit
+            sample_width=2,
             frame_rate=self.sample_rate,
             channels=1
         )
@@ -186,12 +189,11 @@ class CustomPiperVoice:
         return seg
 
 # ---------- Pools e registo de vozes ----------
-voices_registry: Dict = {}          # voice_name -> {"pool": VoicePool, "genero": str, ...}
+voices_registry: Dict = {}
 EFFECTS_CACHE: Dict[str, AudioSegment] = {}
 AMBIENT_CACHE: Dict[str, AudioSegment] = {}
 
 class VoicePool:
-    """Pool de instâncias CustomPiperVoice já carregadas na GPU."""
     def __init__(self, model_path: str, config_path: str, pool_size: int = 2):
         self.pool = queue.Queue(maxsize=pool_size)
         for _ in range(pool_size):
@@ -204,7 +206,7 @@ class VoicePool:
     def put(self, voice):
         self.pool.put(voice)
 
-# ---------- Funções de carregamento de vozes e caches ----------
+# ---------- Carregamento de vozes e caches ----------
 def load_voice_from_folder(voice_name: str, voice_path: Path) -> dict:
     onnx_files = list(voice_path.glob("*.onnx"))
     if not onnx_files:
@@ -336,7 +338,7 @@ def get_ambient(ambient_file: str, volume_db: float) -> AudioSegment:
         AMBIENT_CACHE[base_name] = seg
     return AMBIENT_CACHE[base_name] + volume_db
 
-# ---------- Função de síntese (para usar no pool) ----------
+# ---------- Função de síntese (para o pool) ----------
 def synthesize_speech(voice: CustomPiperVoice, text: str, speed: float,
                       noise_s: float, noise_w: float) -> AudioSegment:
     return voice.synthesize_to_audiosegment(
@@ -405,7 +407,7 @@ gpu_executor: Optional[ThreadPoolExecutor] = None
 mix_executor: Optional[ThreadPoolExecutor] = None
 gpu_semaphore: asyncio.Semaphore = None
 
-# ---------- Instalação dinâmica de dependências ----------
+# ---------- Instalação dinâmica das dependências ----------
 def install_dependencies():
     # Remove libs antigas
     try:
@@ -453,14 +455,17 @@ def diagnose_environment():
 # ---------- Evento de arranque ----------
 @app.on_event("startup")
 async def startup_event():
-    global _onnxruntime
+    global _np, _onnxruntime
     global gpu_executor, mix_executor, gpu_semaphore
 
     logger.info("Inicializando dependências e ambiente...")
     install_dependencies()
 
-    import onnxruntime as _ort_mod
-    _onnxruntime = _ort_mod
+    import numpy as _np_module
+    import onnxruntime as _ort_module
+
+    _np = _np_module
+    _onnxruntime = _ort_module
 
     diagnose_environment()
     preload_all_effects()
