@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Dict, Optional, List, Tuple
 from concurrent.futures import ThreadPoolExecutor
 
-# pydub pode ser importado desde já (não depende de onnxruntime)
 from pydub import AudioSegment
 
 # ---------- Configurações de ambiente e logs ----------
@@ -20,10 +19,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("piper-api")
 
 # ---------- Constantes de otimização ----------
-MAX_GPU_JOBS = 3                # sínteses simultâneas na GPU
-GPU_WORKERS = 2                 # threads no pool da GPU
-MIX_WORKERS = 10                # threads para mixagem
-SAMPLE_RATE_TARGET = 22050      # taxa de amostragem padronizada
+MAX_GPU_JOBS = 3
+GPU_WORKERS = 2
+MIX_WORKERS = 10
+SAMPLE_RATE_TARGET = 22050
 
 # ---------- Diretórios ----------
 BASE_DIR = Path("/app")
@@ -35,7 +34,7 @@ VOICES_DIR.mkdir(exist_ok=True)
 AMBIENT_DIR.mkdir(exist_ok=True)
 EFFECTS_DIR.mkdir(exist_ok=True)
 
-# ---------- Referências atrasadas (serão preenchidas após a instalação) ----------
+# ---------- Referências atrasadas ----------
 _piper_voice = None
 _synth_config = None
 _onnxruntime = None
@@ -60,7 +59,7 @@ voices_registry: Dict = {}
 EFFECTS_CACHE: Dict[str, AudioSegment] = {}
 AMBIENT_CACHE: Dict[str, AudioSegment] = {}
 
-# ---------- Pool de vozes (usa get_piper_voice) ----------
+# ---------- Pool de vozes ----------
 class VoicePool:
     def __init__(self, model_path: str, config_path: str, pool_size: int = 2):
         self.pool = queue.Queue(maxsize=pool_size)
@@ -220,7 +219,7 @@ def get_ambient(ambient_file: str, volume_db: float) -> AudioSegment:
     return ambient + volume_db
 
 
-# ---------- Funções de síntese (usam get_synthesis_config) ----------
+# ---------- Funções de síntese ----------
 def synthesize_speech(voice, text: str, speed: float,
                       noise_s: float, noise_w: float) -> AudioSegment:
     SynthesisConfig = get_synthesis_config()
@@ -303,15 +302,12 @@ from fastapi.responses import Response
 
 app = FastAPI(title="Piper TTS API (GPU factory)")
 
-# Pools globais (inicializados no startup)
 gpu_executor: Optional[ThreadPoolExecutor] = None
 mix_executor: Optional[ThreadPoolExecutor] = None
 gpu_semaphore: asyncio.Semaphore = None
 
 
 def install_dependencies():
-    """Instala numpy e onnxruntime-gpu e remove bibliotecas ONNX antigas."""
-    # Remove libs antigas
     try:
         for f in Path("/app/lib").glob("libonnxruntime*"):
             f.unlink()
@@ -333,7 +329,6 @@ def install_dependencies():
 
 
 def diagnose_environment():
-    """Regista informações sobre o ambiente NVIDIA e ONNX Runtime."""
     ort = get_ort()
     logger.info("========== DIAGNÓSTICO DO AMBIENTE ==========")
     logger.info(f"onnxruntime versão: {ort.__version__}")
@@ -365,23 +360,18 @@ async def startup_event():
     logger.info("Inicializando dependências e ambiente...")
     install_dependencies()
 
-    # Agora importar os módulos
     import onnxruntime as _ort_mod
-    from piper import PiperVoice as _PiperVoice, SynthesisConfig as _SynthesisConfig
+    from piper.voice import PiperVoice as _PiperVoice, SynthesisConfig as _SynthesisConfig   # ← CORRIGIDO AQUI
 
     _piper_voice = _PiperVoice
     _synth_config = _SynthesisConfig
     _onnxruntime = _ort_mod
 
-    # Diagnóstico
     diagnose_environment()
-
-    # Pré-carregamento de efeitos, ambientes e vozes
     preload_all_effects()
     preload_all_ambient()
     load_all_voices()
 
-    # Pools de execução
     gpu_executor = ThreadPoolExecutor(max_workers=GPU_WORKERS)
     mix_executor = ThreadPoolExecutor(max_workers=MIX_WORKERS)
     gpu_semaphore = asyncio.Semaphore(MAX_GPU_JOBS)
@@ -389,7 +379,6 @@ async def startup_event():
     logger.info("Sistema pronto.")
 
 
-# ---------- Lógica da fábrica (assíncrona) ----------
 @app.post("/synthesize", response_class=Response)
 async def synthesize(req: TTSRequest):
     inicio_total = time.perf_counter()
@@ -497,7 +486,6 @@ async def synthesize(req: TTSRequest):
     return Response(content=final_wav, media_type="audio/wav")
 
 
-# ---------- Endpoints de saúde ----------
 @app.get("/started")
 async def started():
     return Response(status_code=200, content="started")
