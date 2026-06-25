@@ -1,55 +1,117 @@
 import os
 import re
 import io
-import wave
 import time
 import queue
 import asyncio
 import logging
 import subprocess
-import tempfile
-import json
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 
 from pydub import AudioSegment
+from piper.voice import PiperVoice, SynthesisConfig   # ← usa o piper-tts original com GPU
 
-# ---------- Configurações ----------
+# ---------- Configuração de logs ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("piper-api")
 
-# Constantes
-MAX_GPU_JOBS = 1                # Apenas uma síntese de cada vez (binário usa GPU intensivamente)
-GPU_WORKERS = 1                 # 1 processo dedicado à GPU
-MIX_WORKERS = 10                # threads para mixagem
+# ---------- Constantes ----------
+MAX_GPU_JOBS = 3
+GPU_WORKERS = 2
+MIX_WORKERS = 10
 SAMPLE_RATE_TARGET = 22050
-PIPER_BIN = "/app/piper/piper"  # binário compilado com CUDA
 
-# Diretórios
+# ---------- Diretórios ----------
 BASE_DIR = Path("/app")
 VOICES_DIR = BASE_DIR / "voices"
 AMBIENT_DIR = BASE_DIR / "ambient"
 EFFECTS_DIR = BASE_DIR / "effects"
+
 VOICES_DIR.mkdir(exist_ok=True)
 AMBIENT_DIR.mkdir(exist_ok=True)
 EFFECTS_DIR.mkdir(exist_ok=True)
 
-# Cache de efeitos e ambientes
+# ---------- Pool de vozes (GPU) ----------
+class VoicePool:
+    def __init__(self, model_path: str, config_path: str, pool_size: int = 2):
+        self.pool = queue.Queue(maxsize=pool_size)
+        for _ in range(pool_size):
+            voice = PiperVoice.load(model_path, config_path=config_path, use_cuda=True)
+            self.pool.put(voice)
+
+    def get(self, timeout=2.0):
+        return self.pool.get(timeout=timeout)
+
+    def put(self, voice):
+        self.pool.put(voice)
+
+# ---------- Registro de vozes e caches ----------
+voices_registry: Dict = {}
 EFFECTS_CACHE: Dict[str, AudioSegment] = {}
 AMBIENT_CACHE: Dict[str, AudioSegment] = {}
 
-# Pool de processos para GPU (executa o binário piper)
-gpu_pool: Optional[ProcessPoolExecutor] = None
-# Pool de threads para mixagem
-mix_pool: Optional[ThreadPoolExecutor] = None
-# Semáforo para controlar acesso concorrente à GPU
-gpu_semaphore: asyncio.Semaphore = None
+def load_voice_from_folder(voice_name: str, voice_path: Path) -> dict:
+    onnx_files = list(voice_path.glob("*.onnx"))
+    if not onnx_files:
+        raise FileNotFoundError(f"Nenhum .onnx em {voice_path}")
+    model_path = str(onnx_files[0])
+    base_name = onnx_files[0].stem
+    json_path = voice_path / f"{base_name}.onnx.json"
+    if not json_path.exists():
+        json_candidates = list(voice_path.glob("*.json"))
+        if not json_candidates:
+            raise FileNotFoundError(f"Nenhum .json para {voice_name}")
+        json_path = json_candidates[0]
+    config_path = str(json_path)
 
-# Vozes disponíveis (apenas metadados, sem carregar modelos)
-voices_registry: Dict[str, Dict] = {}
+    genero = "Desconhecido"
+    meta_path = voice_path / f"{voice_name}.json"
+    if meta_path.exists():
+        import json
+        try:
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+                genero = meta.get("genero", "Desconhecido")
+        except:
+            pass
 
-# ---------- Funções de efeitos e ambientes (mantidas) ----------
+    pool = VoicePool(model_path, config_path, pool_size=2)
+    return {"model_path": model_path, "config_path": config_path, "genero": genero, "pool": pool, "path": voice_path}
+
+def load_all_voices():
+    for item in VOICES_DIR.iterdir():
+        if item.is_dir():
+            voice_name = item.name
+            try:
+                entry = load_voice_from_folder(voice_name, item)
+                voices_registry[voice_name] = entry
+                logger.info(f"✅ Voz carregada: {voice_name} ({entry['genero']})")
+            except Exception as e:
+                logger.error(f"❌ Falha ao carregar voz {voice_name}: {e}")
+
+    for onnx_file in VOICES_DIR.glob("*.onnx"):
+        voice_name = onnx_file.stem
+        if voice_name in voices_registry:
+            continue
+        json_file = onnx_file.with_suffix(".onnx.json")
+        if json_file.exists():
+            try:
+                pool = VoicePool(str(onnx_file), str(json_file), pool_size=2)
+                voices_registry[voice_name] = {
+                    "model_path": str(onnx_file),
+                    "config_path": str(json_file),
+                    "genero": "Personalizada",
+                    "pool": pool,
+                    "path": VOICES_DIR
+                }
+                logger.info(f"✅ Voz personalizada carregada: {voice_name}")
+            except Exception as e:
+                logger.error(f"❌ Erro ao carregar voz {voice_name}: {e}")
+
+    logger.info(f"Total de vozes disponíveis: {len(voices_registry)}")
+
 def preload_all_effects():
     if not EFFECTS_DIR.exists():
         return
@@ -88,7 +150,7 @@ def get_effect(voice_name: str, effect_file: str) -> AudioSegment:
                     seg = seg.set_frame_rate(SAMPLE_RATE_TARGET)
                 return seg
             except Exception as e:
-                raise RuntimeError(f"Erro ao carregar efeito '{effect_file}' da voz: {e}")
+                raise RuntimeError(f"Erro ao carregar efeito '{effect_file}': {e}")
     if effect_file in EFFECTS_CACHE:
         return EFFECTS_CACHE[effect_file]
     global_path = EFFECTS_DIR / effect_file
@@ -111,130 +173,38 @@ def get_ambient(ambient_file: str, volume_db: float) -> AudioSegment:
         AMBIENT_CACHE[ambient_file] = seg
     return AMBIENT_CACHE[ambient_file] + volume_db
 
-# ---------- Função que executa o binário piper (chamada no processo GPU) ----------
-def synthesize_with_piper(voice_name: str, text: str, model_path: str, config_path: str,
-                          speed: float, noise_scale: float, noise_w: float) -> bytes:
-    """
-    Executa o binário piper com aceleração CUDA e devolve os bytes WAV.
-    """
-    # Usa um ficheiro temporário em RAM (tmpfs) para máxima velocidade
-    with tempfile.NamedTemporaryFile(suffix=".wav", dir="/dev/shm", delete=False) as tmp:
-        output_path = tmp.name
-
-    try:
-        cmd = [
-            PIPER_BIN,
-            "--model", model_path,
-            "--config", config_path,
-            "--output_file", output_path,
-            "--cuda",
-            "--length-scale", str(speed),
-            "--noise-scale", str(noise_scale),
-            "--noise-w", str(noise_w),
-            "--text", text
-        ]
-        logger.info(f"Executando piper: {' '.join(cmd)}")
-        subprocess.run(cmd, check=True, timeout=30, capture_output=True)
-
-        # Lê o WAV gerado
-        with open(output_path, "rb") as f:
-            wav_data = f.read()
-        return wav_data
-    finally:
-        try:
-            os.unlink(output_path)
-        except Exception:
-            pass
-
-def synthesize_to_audiosegment(voice_name: str, text: str, model_path: str, config_path: str,
-                               speed: float, noise_scale: float, noise_w: float) -> AudioSegment:
-    """Wrapper que devolve AudioSegment."""
-    wav_bytes = synthesize_with_piper(voice_name, text, model_path, config_path,
-                                      speed, noise_scale, noise_w)
-    seg = AudioSegment.from_wav(io.BytesIO(wav_bytes))
+def synthesize_speech(voice, text: str, speed: float,
+                      noise_s: float, noise_w: float) -> AudioSegment:
+    config = SynthesisConfig(length_scale=speed, noise_scale=noise_s,
+                             noise_w_scale=noise_w, volume=1.0)
+    chunks = voice.synthesize(text, syn_config=config)
+    audio_bytes = b''.join(chunk.audio_int16_bytes for chunk in chunks)
+    sample_rate = voice.config.sample_rate
+    seg = AudioSegment(data=audio_bytes, sample_width=2, frame_rate=sample_rate, channels=1)
     if seg.frame_rate != SAMPLE_RATE_TARGET:
         seg = seg.set_frame_rate(SAMPLE_RATE_TARGET)
     return seg
 
-# ---------- Registro de vozes (apenas metadados) ----------
-def load_voice_metadata(voice_name: str, voice_path: Path) -> dict:
-    onnx_files = list(voice_path.glob("*.onnx"))
-    if not onnx_files:
-        raise FileNotFoundError(f"Nenhum .onnx em {voice_path}")
-    model_path = str(onnx_files[0])
-    base_name = onnx_files[0].stem
-    json_path = voice_path / f"{base_name}.onnx.json"
-    if not json_path.exists():
-        json_candidates = list(voice_path.glob("*.json"))
-        if not json_candidates:
-            raise FileNotFoundError(f"Nenhum .json para {voice_name}")
-        json_path = json_candidates[0]
-    config_path = str(json_path)
-
-    genero = "Desconhecido"
-    meta_path = voice_path / f"{voice_name}.json"
-    if meta_path.exists():
-        try:
-            with open(meta_path, "r") as f:
-                meta = json.load(f)
-                genero = meta.get("genero", "Desconhecido")
-        except:
-            pass
-    return {
-        "model_path": model_path,
-        "config_path": config_path,
-        "genero": genero,
-        "path": voice_path
-    }
-
-def load_all_voices_metadata():
-    for item in VOICES_DIR.iterdir():
-        if item.is_dir():
-            name = item.name
-            try:
-                voices_registry[name] = load_voice_metadata(name, item)
-                logger.info(f"✅ Metadados carregados: {name}")
-            except Exception as e:
-                logger.error(f"❌ Falha ao carregar metadados de {name}: {e}")
-    for onnx_file in VOICES_DIR.glob("*.onnx"):
-        name = onnx_file.stem
-        if name not in voices_registry:
-            json_file = onnx_file.with_suffix(".onnx.json")
-            if json_file.exists():
-                voices_registry[name] = {
-                    "model_path": str(onnx_file),
-                    "config_path": str(json_file),
-                    "genero": "Personalizada",
-                    "path": VOICES_DIR
-                }
-                logger.info(f"✅ Metadados personalizados: {name}")
-    logger.info(f"Total de vozes disponíveis: {len(voices_registry)}")
-
-# ---------- Mixagem ----------
 def mix_and_export(segments: List[AudioSegment], ambient_cfg) -> bytes:
     if not segments:
         raise ValueError("Nenhum segmento")
     combined = AudioSegment.empty()
     for seg in segments:
         combined += seg
-
     target_dbfs = -20.0
     if combined.dBFS != target_dbfs:
-        gain = target_dbfs - combined.dBFS
-        combined = combined.apply_gain(gain)
-
+        combined = combined.apply_gain(target_dbfs - combined.dBFS)
     if ambient_cfg.enabled and ambient_cfg.file:
         ambient = get_ambient(ambient_cfg.file, ambient_cfg.volume_db)
         if len(ambient) < len(combined):
             ambient = ambient * ((len(combined) // len(ambient)) + 1)
         ambient = ambient[:len(combined)]
         combined = combined.overlay(ambient)
-
     with io.BytesIO() as buf:
         combined.export(buf, format="wav")
         return buf.getvalue()
 
-# ---------- Modelos de requisição ----------
+# ---------- Modelos ----------
 from pydantic import BaseModel, Field
 
 class AmbientConfig(BaseModel):
@@ -263,48 +233,41 @@ class TTSRequest(BaseModel):
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 
-app = FastAPI(title="Piper TTS API (GPU via binário)")
+app = FastAPI(title="Piper TTS API (GPU)")
+
+gpu_executor: Optional[ThreadPoolExecutor] = None
+mix_executor: Optional[ThreadPoolExecutor] = None
+gpu_semaphore: asyncio.Semaphore = None
 
 @app.on_event("startup")
 async def startup():
-    global gpu_pool, mix_pool, gpu_semaphore
-
-    logger.info("Pré-carregando efeitos e ambientes...")
+    global gpu_executor, mix_executor, gpu_semaphore
     preload_all_effects()
     preload_all_ambient()
-    load_all_voices_metadata()
-
-    # Pool de processos para GPU (1 processo dedicado)
-    gpu_pool = ProcessPoolExecutor(max_workers=GPU_WORKERS)
-    # Pool de threads para mixagem
-    mix_pool = ThreadPoolExecutor(max_workers=MIX_WORKERS)
+    load_all_voices()
+    gpu_executor = ThreadPoolExecutor(max_workers=GPU_WORKERS)
+    mix_executor = ThreadPoolExecutor(max_workers=MIX_WORKERS)
     gpu_semaphore = asyncio.Semaphore(MAX_GPU_JOBS)
-
-    logger.info("Sistema pronto (GPU via binário piper).")
+    logger.info("Sistema pronto (GPU via piper-tts).")
 
 @app.post("/synthesize", response_class=Response)
 async def synthesize(req: TTSRequest):
     try:
         inicio = time.perf_counter()
-        logger.info(f"🔊 Nova requisição: text='{req.text[:50]}...'")
-
-        # ----- Mapeamento de speakers (igual ao original) -----
         is_dialog = bool(req.speakers)
         if not is_dialog:
-            if not req.voice:
-                raise HTTPException(400, "Campo 'voice' é obrigatório no modo simples")
-            if req.voice not in voices_registry:
-                raise HTTPException(404, f"Voz não encontrada: {req.voice}")
+            if not req.voice: raise HTTPException(400, "voice obrigatório")
+            if req.voice not in voices_registry: raise HTTPException(404, "Voz não encontrada")
             speaker_params = {None: (req.voice, req.speed, req.noise_scale, req.noise_w_scale)}
         else:
             speaker_params = {}
             for spk in req.speakers:
-                noise_s = spk.noise_scale if spk.noise_scale is not None else req.noise_scale
-                noise_w = spk.noise_w_scale if spk.noise_w_scale is not None else req.noise_w_scale
-                speaker_params[spk.role] = (spk.voice, spk.speed, noise_s, noise_w)
-            for role, (voice_name, _, _, _) in speaker_params.items():
+                ns = spk.noise_scale if spk.noise_scale is not None else req.noise_scale
+                nw = spk.noise_w_scale if spk.noise_w_scale is not None else req.noise_w_scale
+                speaker_params[spk.role] = (spk.voice, spk.speed, ns, nw)
+            for voice_name, _, _, _ in speaker_params.values():
                 if voice_name not in voices_registry:
-                    raise HTTPException(404, f"Voz '{voice_name}' do speaker '{role}' não encontrada")
+                    raise HTTPException(404, f"Voz '{voice_name}' não encontrada")
 
         parts = re.split(r'(\[.*?\])', req.text)
         current_role = None
@@ -312,125 +275,65 @@ async def synthesize(req: TTSRequest):
 
         for part in parts:
             part = part.strip()
-            if not part:
-                continue
-
+            if not part: continue
             if is_dialog and part.startswith('[') and part.endswith(']'):
                 role = part[1:-1]
-                if role in speaker_params:
-                    current_role = role
+                if role in speaker_params: current_role = role
                 continue
-
             if part in req.effects:
-                effect_file = req.effects[part]
-                voice_for_effect = speaker_params[current_role][0] if is_dialog and current_role else req.voice
-                segments.append({"type": "effect", "effect_file": effect_file, "voice_name": voice_for_effect})
+                vname = speaker_params[current_role][0] if is_dialog and current_role else req.voice
+                segments.append({"type": "effect", "effect_file": req.effects[part], "voice_name": vname})
                 continue
-
             if is_dialog:
-                if current_role is None:
-                    raise HTTPException(400, "Nenhum speaker definido antes do texto.")
+                if current_role is None: raise HTTPException(400, "Speaker não definido")
                 voice_name, speed, noise_s, noise_w = speaker_params[current_role]
             else:
                 voice_name, speed, noise_s, noise_w = speaker_params[None]
+            segments.append({"type": "speech", "voice_name": voice_name, "text": part, "speed": speed, "noise_s": noise_s, "noise_w": noise_w})
 
-            segments.append({
-                "type": "speech",
-                "voice_name": voice_name,
-                "text": part,
-                "speed": speed,
-                "noise_s": noise_s,
-                "noise_w": noise_w
-            })
-
-        if not segments:
-            raise HTTPException(400, "Nenhum segmento de áudio gerado.")
+        if not segments: raise HTTPException(400, "Nenhum segmento")
 
         loop = asyncio.get_running_loop()
 
-        async def process_segment(index: int, seg: dict) -> Tuple[int, AudioSegment]:
+        async def process_segment(index: int, seg: dict):
             if seg["type"] == "effect":
                 return index, get_effect(seg["voice_name"], seg["effect_file"])
-
             voice_name = seg["voice_name"]
-            meta = voices_registry[voice_name]
-
+            pool = voices_registry[voice_name]["pool"]
             async with gpu_semaphore:
-                # Executa o binário piper no processo GPU
-                audio = await loop.run_in_executor(
-                    gpu_pool,
-                    synthesize_to_audiosegment,
-                    voice_name,
-                    seg["text"],
-                    meta["model_path"],
-                    meta["config_path"],
-                    seg["speed"],
-                    seg["noise_s"],
-                    seg["noise_w"]
-                )
+                voice = await loop.run_in_executor(gpu_executor, pool.get)
+                try:
+                    audio = await loop.run_in_executor(gpu_executor, synthesize_speech, voice, seg["text"], seg["speed"], seg["noise_s"], seg["noise_w"])
+                finally:
+                    pool.put(voice)
             return index, audio
 
-        tasks = [process_segment(i, seg) for i, seg in enumerate(segments)]
-        results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*[process_segment(i, s) for i, s in enumerate(segments)])
         results.sort(key=lambda x: x[0])
         audio_segments = [seg for _, seg in results]
 
-        final_wav = await loop.run_in_executor(
-            mix_pool,
-            mix_and_export,
-            audio_segments,
-            req.ambient
-        )
-
-        duracao_total = len(final_wav) / (2 * SAMPLE_RATE_TARGET)
+        final_wav = await loop.run_in_executor(mix_executor, mix_and_export, audio_segments, req.ambient)
+        duracao = len(final_wav) / (2 * SAMPLE_RATE_TARGET)
         tempo_total = time.perf_counter() - inicio
-        logger.info(f"✅ Síntese finalizada | tempo_total={tempo_total:.3f}s | áudio={duracao_total:.2f}s | RTF={tempo_total/duracao_total:.3f}")
-
+        logger.info(f"✅ Síntese finalizada | tempo_total={tempo_total:.3f}s | áudio={duracao:.2f}s | RTF={tempo_total/duracao:.3f}")
         return Response(content=final_wav, media_type="audio/wav")
-
     except HTTPException:
         raise
     except Exception:
-        import traceback
-        logger.error("Erro não tratado na síntese:\n" + traceback.format_exc())
-        raise HTTPException(500, "Erro interno no processamento da síntese")
+        logger.exception("Erro na síntese")
+        raise HTTPException(500, "Erro interno")
 
 # Endpoints de saúde
 @app.get("/started")
 async def started():
     return Response(status_code=200, content="started")
-
 @app.get("/ready")
 async def ready():
-    if len(voices_registry) > 0:
-        return Response(status_code=200, content="ready")
+    if voices_registry: return Response(status_code=200, content="ready")
     return Response(status_code=503, content="loading model")
-
 @app.get("/live")
 async def live():
     return Response(status_code=200, content="alive")
-
 @app.get("/health")
 async def health():
-    return {
-        "status": "ok",
-        "gpu": True,
-        "voices_loaded": list(voices_registry.keys()),
-        "total_voices": len(voices_registry)
-    }
-
-@app.get("/gpu-health")
-async def gpu_health():
-    try:
-        smi = subprocess.check_output(["nvidia-smi"], text=True)
-    except Exception as e:
-        smi = str(e)
-    return {
-        "nvidia_smi": smi.strip(),
-        "binario": PIPER_BIN,
-        "cuda_disponivel": os.path.exists(PIPER_BIN)
-    }
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    return {"status": "ok", "gpu": True, "voices": list(voices_registry.keys()), "total": len(voices_registry)}
