@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Piper TTS API – GPU via binário piper compilado
-Arquitetura: pool de processos piper → síntese paralela → mixagem em processos separados
+Comunicação robusta: JSON + arquivo WAV temporário
 """
 
 import os
@@ -14,6 +14,7 @@ import logging
 import asyncio
 import subprocess
 import threading
+import tempfile
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Any
 
@@ -69,7 +70,7 @@ mixing_executor = ProcessPoolExecutor(max_workers=MIXING_PROCESSES)
 logger.info(f"Paralelismo: {SYNTHESIS_THREADS} threads síntese, {MIXING_PROCESSES} processos mixagem, pool piper={PIPER_POOL_SIZE}")
 
 # =============================================================================
-# PiperProcess – gerencia um subprocesso do binário piper
+# PiperProcess – agora com `--output_dir` (sem mistura texto/binário)
 # =============================================================================
 class PiperProcess:
     def __init__(self, model_path: str, config_path: str, use_cuda: bool = True):
@@ -80,6 +81,8 @@ class PiperProcess:
         self.lock = threading.Lock()
         self._stderr_lines = []
         self._stderr_thread = None
+        # Cria um diretório temporário para os WAVs
+        self.temp_dir = tempfile.mkdtemp(prefix="piper_")
         self._start()
 
     def _start(self):
@@ -88,7 +91,7 @@ class PiperProcess:
             "--model", self.model_path,
             "--config", self.config_path,
             "--json-input",
-            "--output-raw"
+            "--output_dir", self.temp_dir   # <- grava arquivo WAV
         ]
         if self.use_cuda:
             cmd.append("--cuda")
@@ -100,7 +103,8 @@ class PiperProcess:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                bufsize=0
+                bufsize=1,          # line-buffered para a linha JSON
+                text=True           # modo texto para stdout (a linha JSON)
             )
         except Exception as e:
             logger.error(f"[PIPER] Falha ao criar subprocesso: {e}")
@@ -119,13 +123,13 @@ class PiperProcess:
         logger.info(f"[PIPER] Pronto (PID {self.process.pid}) para {Path(self.model_path).name}")
 
     def _read_stderr(self):
-        for line in iter(self.process.stderr.readline, b''):
+        for line in self.process.stderr:
             self._stderr_lines.append(line)
             if len(self._stderr_lines) > 100:
                 self._stderr_lines.pop(0)
 
     def _get_stderr_tail(self) -> str:
-        return b"".join(self._stderr_lines).decode(errors='replace')
+        return "".join(self._stderr_lines[-10:])  # últimas 10 linhas
 
     def synthesize(self, text: str, length_scale: float = 1.0,
                    noise_scale: float = 0.667, noise_w_scale: float = 0.8) -> Tuple[bytes, int]:
@@ -137,28 +141,29 @@ class PiperProcess:
         }
         with self.lock:
             try:
-                self.process.stdin.write((json.dumps(request) + "\n").encode())
+                # Envia requisição
+                self.process.stdin.write(json.dumps(request) + "\n")
                 self.process.stdin.flush()
 
-                # Leitura byte‑a‑byte até '\n' (EVITA misturar com áudio)
-                line_bytes = b""
-                while True:
-                    ch = self.process.stdout.read(1)
-                    if not ch:
-                        raise RuntimeError("Processo piper morreu antes de enviar JSON")
-                    if ch == b'\n':
-                        break
-                    line_bytes += ch
+                # Lê a linha JSON de resposta (agora stdout é texto)
+                line = self.process.stdout.readline()
+                if not line:
+                    raise RuntimeError("Processo piper morreu antes de responder")
+                response = json.loads(line)
 
-                response = json.loads(line_bytes.decode('utf-8'))
-                num_samples = response.get("num_samples", 0)
-                sample_rate = response.get("sample_rate", 22050)
+                # O caminho do arquivo gerado está em response["output_file"]
+                wav_path = response.get("output_file")
+                if not wav_path or not os.path.isfile(wav_path):
+                    raise RuntimeError(f"Arquivo WAV não encontrado: {wav_path}")
 
-                raw_audio = self.process.stdout.read(num_samples * 2)
-                if len(raw_audio) != num_samples * 2:
-                    logger.warning(f"[PIPER] Tamanho de áudio inesperado: esperado {num_samples*2}, recebido {len(raw_audio)}")
+                # Lê o arquivo WAV e extrai PCM + sample rate
+                audio = AudioSegment.from_wav(wav_path)
+                pcm = audio.raw_data       # PCM 16-bit
+                sample_rate = audio.frame_rate
+                # Remove o arquivo temporário imediatamente
+                os.remove(wav_path)
 
-                return raw_audio, sample_rate
+                return pcm, sample_rate
 
             except (json.JSONDecodeError, KeyError) as e:
                 stderr_tail = self._get_stderr_tail()
@@ -179,6 +184,10 @@ class PiperProcess:
             except:
                 pass
             self.process = None
+        # Remove o diretório temporário antigo e cria um novo
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+        self.temp_dir = tempfile.mkdtemp(prefix="piper_")
         self._start()
 
     def is_alive(self) -> bool:
@@ -251,7 +260,7 @@ logger.info(f"Total de vozes carregadas: {len(voice_pools)}")
 MODEL_LOADED = len(voice_pools) > 0
 
 # =============================================================================
-# Warm-up (com a voz faber)
+# Warm-up
 # =============================================================================
 logger.info("=" * 70)
 logger.info("🔥 WARM-UP")
@@ -338,7 +347,7 @@ class TTSRequest(BaseModel):
 # =============================================================================
 # FastAPI app
 # =============================================================================
-app = FastAPI(title="Piper TTS GPU (via binário piper)")
+app = FastAPI(title="Piper TTS GPU (via binário piper, WAV temporário)")
 
 @app.post("/synthesize", response_class=Response)
 async def synthesize(req: TTSRequest):
@@ -398,6 +407,7 @@ async def synthesize(req: TTSRequest):
             ordered_items.append({'type': 'effect', 'wav_bytes': effect_cache[effect_name]})
             continue
 
+        # Fala
         if is_dialog:
             if current_role is None:
                 raise HTTPException(400, "Speaker não definido")
@@ -415,7 +425,7 @@ async def synthesize(req: TTSRequest):
     if not synthesis_tasks:
         raise HTTPException(400, "Nenhum texto para sintetizar")
 
-    # Sínteses em paralelo
+    # Síntese em paralelo
     futures = {}
     for idx, vname, txt, sp, ns, nw in synthesis_tasks:
         pool = voice_pools[vname]
