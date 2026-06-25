@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Piper TTS API – GPU via piper-tts Python + onnxruntime-gpu
-Arquitetura: pool de sessões ONNX por voz → síntese paralela → mixagem em processos separados
+Piper TTS API – GPU via binário piper compilado
+Arquitetura: pool de processos piper → síntese paralela → mixagem em processos separados
 """
 
 import os
@@ -13,7 +13,7 @@ import queue
 import logging
 import asyncio
 import subprocess
-import sys
+import threading
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Any
 
@@ -22,35 +22,6 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
-
-# =============================================================================
-# Verificação e instalação automática do onnxruntime-gpu (se necessário)
-# =============================================================================
-def ensure_gpu_onnx():
-    try:
-        import onnxruntime as ort
-        if 'CUDAExecutionProvider' in ort.get_available_providers():
-            return True
-    except ImportError:
-        pass
-
-    logging.warning("CUDAExecutionProvider não encontrado. Tentando instalar onnxruntime-gpu...")
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir", "onnxruntime-gpu==1.14.1"])
-        import onnxruntime as ort
-        if 'CUDAExecutionProvider' in ort.get_available_providers():
-            logging.info("✅ onnxruntime-gpu instalado com sucesso!")
-            return True
-    except Exception as e:
-        logging.error(f"Falha ao instalar onnxruntime-gpu: {e}")
-    return False
-
-# Aguarda um pouco para garantir que a rede está disponível
-time.sleep(2)
-GPU_ACTIVE = ensure_gpu_onnx()
-
-# Agora importa o PiperVoice (que depende do onnxruntime)
-from piper import PiperVoice
 
 # =============================================================================
 # Configuração de logging
@@ -63,9 +34,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("piper-api")
 
-# =============================================================================
-# Função auxiliar para comandos
-# =============================================================================
 def run_cmd(cmd: list, timeout=10):
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -80,17 +48,6 @@ logger.info("=" * 70)
 logger.info("DIAGNÓSTICO DE AMBIENTE")
 gpu_info = run_cmd(["nvidia-smi"], timeout=5)
 logger.info("nvidia-smi:\n" + gpu_info)
-
-try:
-    import onnxruntime as ort
-    providers = ort.get_available_providers()
-    logger.info(f"ONNX Runtime providers: {providers}")
-    if 'CUDAExecutionProvider' in providers:
-        logger.info("✅ CUDAExecutionProvider disponível – GPU ativa")
-    else:
-        logger.warning("⚠️ CUDAExecutionProvider NÃO encontrado – verifique onnxruntime-gpu")
-except ImportError:
-    logger.error("onnxruntime não instalado!")
 logger.info("=" * 70)
 
 # =============================================================================
@@ -105,57 +62,155 @@ for d in (VOICES_DIR, AMBIENT_DIR, EFFECTS_DIR):
 
 SYNTHESIS_THREADS = int(os.getenv("SYNTHESIS_THREADS", "8"))
 MIXING_PROCESSES = int(os.getenv("MIXING_PROCESSES", "8"))
-SESSION_POOL_SIZE = int(os.getenv("SESSION_POOL_SIZE", "2"))
+PIPER_POOL_SIZE = int(os.getenv("PIPER_POOL_SIZE", "2"))
 
 synthesis_executor = ThreadPoolExecutor(max_workers=SYNTHESIS_THREADS)
 mixing_executor = ProcessPoolExecutor(max_workers=MIXING_PROCESSES)
-logger.info(f"Paralelismo: {SYNTHESIS_THREADS} threads síntese, {MIXING_PROCESSES} processos mixagem, pool={SESSION_POOL_SIZE}")
+logger.info(f"Paralelismo: {SYNTHESIS_THREADS} threads síntese, {MIXING_PROCESSES} processos mixagem, pool piper={PIPER_POOL_SIZE}")
 
 # =============================================================================
-# Pool de sessões ONNX por voz
+# PiperProcess – gerencia um subprocesso do binário piper
 # =============================================================================
-class VoiceSessionPool:
-    def __init__(self, model_path: str, config_path: str):
+class PiperProcess:
+    def __init__(self, model_path: str, config_path: str, use_cuda: bool = True):
         self.model_path = model_path
         self.config_path = config_path
-        self.pool = queue.Queue(maxsize=SESSION_POOL_SIZE)
-        self._init_sessions()
+        self.use_cuda = use_cuda
+        self.process = None
+        self.lock = threading.Lock()
+        self._stderr_lines = []
+        self._stderr_thread = None
+        self._start()
 
-    def _init_sessions(self):
-        for i in range(SESSION_POOL_SIZE):
-            try:
-                voice = PiperVoice.load(
-                    self.model_path,
-                    config_path=self.config_path,
-                    use_cuda=GPU_ACTIVE  # usa a variável global
-                )
-                self.pool.put(voice)
-                logger.info(f"  → Sessão {i+1}/{SESSION_POOL_SIZE} para {Path(self.model_path).stem}")
-            except Exception as e:
-                logger.error(f"  ✗ Falha ao criar sessão {i+1}: {e}")
-        if self.pool.empty():
-            raise RuntimeError("Nenhuma sessão ONNX pôde ser criada.")
+    def _start(self):
+        cmd = [
+            "/app/piper-bin",
+            "--model", self.model_path,
+            "--config", self.config_path,
+            "--json-input",
+            "--output-raw"
+        ]
+        if self.use_cuda:
+            cmd.append("--cuda")
 
-    def synthesize(self, text: str, length_scale: float, noise_scale: float, noise_w_scale: float) -> Tuple[bytes, int]:
-        voice = self.pool.get()
+        logger.info(f"[PIPER] Iniciando: {' '.join(cmd)}")
         try:
-            # Chamada sem volume e sem SynthesisConfig
-            audio_stream = voice.synthesize(
-                text,
-                length_scale=length_scale,
-                noise_scale=noise_scale,
-                noise_w=noise_w_scale
+            self.process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0
             )
-            pcm = b''.join(chunk.audio_int16_bytes for chunk in audio_stream)
-            sample_rate = voice.config.sample_rate
-            return pcm, sample_rate
+        except Exception as e:
+            logger.error(f"[PIPER] Falha ao criar subprocesso: {e}")
+            raise
+
+        self._stderr_lines = []
+        self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
+        self._stderr_thread.start()
+
+        time.sleep(2.0)
+        if self.process.poll() is not None:
+            stderr_tail = self._get_stderr_tail()
+            logger.error(f"[PIPER] Processo morreu na inicialização. stderr: {stderr_tail[-500:]}")
+            raise RuntimeError(f"Piper morreu ao iniciar. stderr: {stderr_tail[-200:]}")
+
+        logger.info(f"[PIPER] Pronto (PID {self.process.pid}) para {Path(self.model_path).name}")
+
+    def _read_stderr(self):
+        for line in iter(self.process.stderr.readline, b''):
+            self._stderr_lines.append(line)
+            if len(self._stderr_lines) > 100:
+                self._stderr_lines.pop(0)
+
+    def _get_stderr_tail(self) -> str:
+        return b"".join(self._stderr_lines).decode(errors='replace')
+
+    def synthesize(self, text: str, length_scale: float = 1.0,
+                   noise_scale: float = 0.667, noise_w_scale: float = 0.8) -> Tuple[bytes, int]:
+        request = {
+            "text": text,
+            "length_scale": length_scale,
+            "noise_scale": noise_scale,
+            "noise_w": noise_w_scale
+        }
+        with self.lock:
+            try:
+                self.process.stdin.write((json.dumps(request) + "\n").encode())
+                self.process.stdin.flush()
+
+                # Leitura byte‑a‑byte até '\n' (EVITA misturar com áudio)
+                line_bytes = b""
+                while True:
+                    ch = self.process.stdout.read(1)
+                    if not ch:
+                        raise RuntimeError("Processo piper morreu antes de enviar JSON")
+                    if ch == b'\n':
+                        break
+                    line_bytes += ch
+
+                response = json.loads(line_bytes.decode('utf-8'))
+                num_samples = response.get("num_samples", 0)
+                sample_rate = response.get("sample_rate", 22050)
+
+                raw_audio = self.process.stdout.read(num_samples * 2)
+                if len(raw_audio) != num_samples * 2:
+                    logger.warning(f"[PIPER] Tamanho de áudio inesperado: esperado {num_samples*2}, recebido {len(raw_audio)}")
+
+                return raw_audio, sample_rate
+
+            except (json.JSONDecodeError, KeyError) as e:
+                stderr_tail = self._get_stderr_tail()
+                logger.error(f"[PIPER] Erro de parsing: {e}. stderr: {stderr_tail[-500:]}")
+                self._restart()
+                raise RuntimeError(f"Falha na comunicação com piper: {e}")
+            except (BrokenPipeError, Exception) as e:
+                stderr_tail = self._get_stderr_tail()
+                logger.error(f"[PIPER] Exceção: {e}. stderr: {stderr_tail[-500:]}")
+                self._restart()
+                raise
+
+    def _restart(self):
+        logger.warning("[PIPER] Reiniciando processo...")
+        if self.process:
+            try:
+                self.process.kill()
+            except:
+                pass
+            self.process = None
+        self._start()
+
+    def is_alive(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+# =============================================================================
+# Pool de processos Piper por voz
+# =============================================================================
+class PiperProcessPool:
+    def __init__(self, model_path: str, config_path: str, pool_size: int = PIPER_POOL_SIZE):
+        self.pool = queue.Queue(maxsize=pool_size)
+        for i in range(pool_size):
+            try:
+                proc = PiperProcess(model_path, config_path, use_cuda=True)
+                self.pool.put(proc)
+                logger.info(f"  → Piper worker {i+1}/{pool_size} para {Path(model_path).stem}")
+            except Exception as e:
+                logger.error(f"  ✗ Falha ao criar worker Piper {i+1}: {e}")
+        if self.pool.empty():
+            raise RuntimeError("Nenhum processo Piper pôde ser iniciado.")
+
+    def synthesize(self, text, length_scale, noise_scale, noise_w_scale):
+        proc = self.pool.get()
+        try:
+            return proc.synthesize(text, length_scale, noise_scale, noise_w_scale)
         finally:
-            self.pool.put(voice)
+            self.pool.put(proc)
 
 # =============================================================================
 # Carregamento das vozes
 # =============================================================================
-voice_pools: Dict[str, VoiceSessionPool] = {}
+voice_pools: Dict[str, PiperProcessPool] = {}
 
 def load_voice(voice_name: str, voice_dir: Path):
     onnx_files = list(voice_dir.glob("*.onnx"))
@@ -169,10 +224,10 @@ def load_voice(voice_name: str, voice_dir: Path):
             raise FileNotFoundError(f"Nenhum .json para {voice_name}")
         json_path = json_candidates[0]
     config_path = str(json_path)
-    logger.info(f"Carregando voz {voice_name} (pool de {SESSION_POOL_SIZE} sessões)")
-    pool = VoiceSessionPool(model_path, config_path)
+    logger.info(f"Carregando voz {voice_name} (pool de {PIPER_POOL_SIZE} processos)")
+    pool = PiperProcessPool(model_path, config_path, pool_size=PIPER_POOL_SIZE)
     voice_pools[voice_name] = pool
-    logger.info(f"✅ Voz {voice_name} pronta (GPU={GPU_ACTIVE})")
+    logger.info(f"✅ Voz {voice_name} pronta (GPU)")
 
 for item in VOICES_DIR.iterdir():
     if item.is_dir():
@@ -196,7 +251,7 @@ logger.info(f"Total de vozes carregadas: {len(voice_pools)}")
 MODEL_LOADED = len(voice_pools) > 0
 
 # =============================================================================
-# WARM-UP
+# Warm-up (com a voz faber)
 # =============================================================================
 logger.info("=" * 70)
 logger.info("🔥 WARM-UP")
@@ -218,7 +273,7 @@ else:
 logger.info("=" * 70)
 
 # =============================================================================
-# Mixagem para ProcessPoolExecutor
+# Mixagem em processo separado
 # =============================================================================
 def mixing_task(ordered_items, ambient_bytes, ambient_volume_db, target_dbfs=-20.0):
     import logging as mix_log
@@ -283,7 +338,7 @@ class TTSRequest(BaseModel):
 # =============================================================================
 # FastAPI app
 # =============================================================================
-app = FastAPI(title="Piper TTS GPU (Otimizado)")
+app = FastAPI(title="Piper TTS GPU (via binário piper)")
 
 @app.post("/synthesize", response_class=Response)
 async def synthesize(req: TTSRequest):
@@ -328,7 +383,7 @@ async def synthesize(req: TTSRequest):
             effect_name = req.effects[part]
             if effect_name not in effect_cache:
                 voice_name_eff = speaker_map[current_role][0] if is_dialog and current_role else req.voice
-                voice_dir = Path(voice_pools[voice_name_eff].model_path).parent
+                voice_dir = Path(voice_pools[voice_name_eff].pool.queue[0].model_path).parent
                 effect_path = None
                 if (voice_dir / effect_name).exists():
                     effect_path = voice_dir / effect_name
@@ -343,7 +398,6 @@ async def synthesize(req: TTSRequest):
             ordered_items.append({'type': 'effect', 'wav_bytes': effect_cache[effect_name]})
             continue
 
-        # Fala
         if is_dialog:
             if current_role is None:
                 raise HTTPException(400, "Speaker não definido")
@@ -361,7 +415,7 @@ async def synthesize(req: TTSRequest):
     if not synthesis_tasks:
         raise HTTPException(400, "Nenhum texto para sintetizar")
 
-    # Paralelizar sínteses
+    # Sínteses em paralelo
     futures = {}
     for idx, vname, txt, sp, ns, nw in synthesis_tasks:
         pool = voice_pools[vname]
@@ -409,7 +463,7 @@ async def live(): return Response(status_code=200, content="alive")
 async def health():
     return {
         "status": "ok",
-        "gpu": GPU_ACTIVE,
+        "gpu": True,
         "warmup": warmup_success,
         "voices_loaded": list(voice_pools.keys()),
         "total_voices": len(voice_pools)
