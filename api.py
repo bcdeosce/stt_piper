@@ -241,8 +241,7 @@ def load_all_voices():
     logger.info(f"Total de vozes carregadas: {len(voices_registry)}")
 
 # ---------- Síntese de um fragmento ----------
-def synthesize_text(voice_name: str, text: str, speed: float,
-                    noise_scale: float, noise_w_scale: float):
+def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
     global active_synthesis_count
     with active_synthesis_lock:
         active_synthesis_count += 1
@@ -265,10 +264,15 @@ def synthesize_text(voice_name: str, text: str, speed: float,
         synth_time = time.perf_counter() - t_pool_end
         record_worker_job(synth_time)
         return sample_rate, audio_bytes, pool_wait
+    except Exception:
+        # Se algo falhar, devolvemos um segmento vazio para não quebrar o fluxo
+        logger.exception("Erro na síntese de um fragmento")
+        return 22050, b"", pool_wait
     finally:
         pool.put(voice)
         with active_synthesis_lock:
-            active_synthesis_count -= 1
+            if active_synthesis_count > 0:
+                active_synthesis_count -= 1
 
 # ---------- Mixagem com pydub ----------
 def mix_and_concat(segments_data, ambient_cfg, target_rate=22050):
