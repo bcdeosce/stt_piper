@@ -26,8 +26,13 @@ from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
 
-# ---------- Logging com buffer ----------
+# ---------- Silenciar logs excessivos do ONNX Runtime ----------
+ort.set_default_logger_severity(4)  # FATAL apenas
+logging.getLogger("onnxruntime").setLevel(logging.ERROR)
+
+# ---------- Logging da aplicação ----------
 class MemoryHandler(logging.Handler):
+    """Guarda as últimas N mensagens de log em memória (apenas WARNING+)."""
     def __init__(self, capacity=100):
         super().__init__()
         self.capacity = capacity
@@ -39,13 +44,23 @@ class MemoryHandler(logging.Handler):
             self.buffer.pop(0)
 
 memory_handler = MemoryHandler(capacity=100)
-memory_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s'))
+memory_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
 
+# Configura o logger raiz para mostrar apenas INFO no stdout e guardar WARNING+ no buffer
 logging.basicConfig(
     level=logging.INFO,
-    handlers=[logging.StreamHandler(sys.stdout), memory_handler],
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        memory_handler
+    ]
 )
+# Reduz o nível dos handlers individuais se necessário (o StreamHandler já está INFO)
+logging.getLogger().handlers[0].setLevel(logging.INFO)
+memory_handler.setLevel(logging.WARNING)
+
 logger = logging.getLogger("piper-api")
+logger.setLevel(logging.DEBUG)  # permite debug internamente, mas os handlers filtram
 
 # ---------- Variáveis de ambiente ----------
 MAX_GPU_JOBS = int(os.getenv("MAX_GPU_JOBS", "3"))
@@ -82,7 +97,7 @@ _thread_local = threading.local()
 _next_worker_id = 0
 _worker_id_lock = threading.Lock()
 
-# Contador de sínteses ativas no momento
+# Contador de sínteses ativas
 active_synthesis_count = 0
 active_synthesis_lock = threading.Lock()
 
@@ -155,7 +170,7 @@ voices_registry: Dict[str, Dict] = {}
 class VoicePool:
     def __init__(self, model_path: str, config_path: str, pool_size: int = None):
         if pool_size is None:
-            pool_size = GPU_WORKERS   # <-- agora igual ao número de threads do pool
+            pool_size = GPU_WORKERS
         import queue
         self.pool = queue.Queue(maxsize=pool_size)
         for _ in range(pool_size):
@@ -207,9 +222,9 @@ def load_all_voices():
             name = item.name
             try:
                 voices_registry[name] = load_voice_from_folder(name, item)
-                logger.info(f"✅ Voz carregada: {name}")
+                logger.debug(f"Voz carregada: {name}")
             except Exception as e:
-                logger.error(f"❌ Falha ao carregar voz {name}: {e}")
+                logger.error(f"Falha ao carregar voz {name}: {e}")
 
     for onnx_file in VOICES_DIR.glob("*.onnx"):
         name = onnx_file.stem
@@ -226,13 +241,13 @@ def load_all_voices():
                     "pool": pool,
                     "path": VOICES_DIR
                 }
-                logger.info(f"✅ Voz raiz carregada: {name}")
+                logger.debug(f"Voz raiz carregada: {name}")
             except Exception as e:
-                logger.error(f"❌ Erro ao carregar voz {name}: {e}")
+                logger.error(f"Erro ao carregar voz {name}: {e}")
 
-    logger.info(f"Total de vozes: {len(voices_registry)}")
+    logger.info(f"Total de vozes carregadas: {len(voices_registry)}")
 
-# ---------- Síntese de um fragmento (com métrica de atividade) ----------
+# ---------- Síntese de um fragmento ----------
 def synthesize_text(voice_name: str, text: str, speed: float,
                     noise_scale: float, noise_w_scale: float):
     global active_synthesis_count
@@ -284,7 +299,7 @@ def mix_and_concat(segments_data, ambient_cfg, target_rate=22050):
             if not effect_path.exists():
                 effect_path = EFFECTS_DIR / data['effect']
             if not effect_path.exists():
-                logger.warning(f"Efeito '{data['effect']}' não encontrado, ignorando.")
+                logger.debug(f"Efeito '{data['effect']}' não encontrado, ignorando.")
                 continue
             try:
                 effect_seg = AudioSegment.from_wav(str(effect_path))
@@ -313,11 +328,10 @@ def mix_and_concat(segments_data, ambient_cfg, target_rate=22050):
                     ambient = ambient * ((len(combined) // len(ambient)) + 1)
                 ambient = ambient[:len(combined)]
                 combined = combined.overlay(ambient)
-                logger.info(f"✔ Ambiente '{ambient_cfg['file']}' aplicado.")
             except Exception as e:
                 logger.error(f"Erro ao aplicar ambiente: {e}")
         else:
-            logger.warning(f"Ficheiro de ambiente '{ambient_cfg['file']}.wav' não encontrado.")
+            logger.debug(f"Ficheiro de ambiente '{ambient_cfg['file']}.wav' não encontrado.")
 
     with io.BytesIO() as buf:
         combined.export(buf, format="wav")
@@ -350,7 +364,7 @@ class TTSRequest(BaseModel):
     speakers: List[SpeakerMapping] = Field(default_factory=list)
 
 # ---------- FastAPI ----------
-app = FastAPI(title="Piper TTS API (GPU + pydub)")
+app = FastAPI(title="Piper TTS API (GPU)")
 
 @app.on_event("startup")
 async def startup():
@@ -359,13 +373,12 @@ async def startup():
     gpu_semaphore = asyncio.Semaphore(MAX_GPU_JOBS)
     gpu_executor = ThreadPoolExecutor(max_workers=GPU_WORKERS)
     mix_executor = ThreadPoolExecutor(max_workers=MIX_WORKERS)
-    logger.info(f"Sistema pronto (GPU={MAX_GPU_JOBS}, workers GPU={GPU_WORKERS}, mix={MIX_WORKERS}).")
+    logger.info(f"Sistema pronto. Workers GPU={GPU_WORKERS}, Mix={MIX_WORKERS}, MaxGPU={MAX_GPU_JOBS}")
 
 # ================= ENDPOINT DE SÍNTESE =================
 @app.post("/synthesize", response_class=Response)
 async def synthesize(req: TTSRequest):
     t_total_start = time.perf_counter()
-    logger.info(f"Síntese solicitada: text='{req.text[:50]}...'")
     is_dialog = bool(req.speakers)
 
     if not is_dialog:
@@ -465,7 +478,7 @@ async def synthesize(req: TTSRequest):
 
     logger.info(
         f"✅ Síntese concluída | total={t_total:.3f}s | tts_wall={tts_wall_time:.3f}s | "
-        f"mix={mix_time:.3f}s | queue_wait={total_queue_wait:.3f}s"
+        f"mix={mix_time:.3f}s | fila={total_queue_wait:.3f}s"
     )
     return Response(content=wav_bytes, media_type="audio/wav")
 
@@ -562,21 +575,20 @@ async def gpu_diagnostics():
         "voices_loaded": list(voices_registry.keys())
     }
 
-# ---------- Workers (agora com atividade) ----------
+# ---------- Workers ----------
 @app.get("/workers")
 async def get_workers():
     return {
         "tts_workers": GPU_WORKERS,
         "mix_workers": MIX_WORKERS,
         "max_gpu_jobs": MAX_GPU_JOBS,
-        "active_gpu_jobs": active_synthesis_count,   # <-- quantas sínteses estão a decorrer agora
+        "active_gpu_jobs": active_synthesis_count,
         "per_worker": compute_worker_stats()
     }
 
-# ---------- Recursos (CPU e GPU) ----------
+# ---------- Recursos ----------
 @app.get("/resources")
 async def get_resources():
-    # GPU utilization via nvidia-smi
     gpu_util = -1.0
     try:
         out = subprocess.check_output(
@@ -587,7 +599,6 @@ async def get_resources():
     except Exception:
         pass
 
-    # CPU utilization do processo (usando psutil se disponível)
     cpu_util = -1.0
     try:
         import psutil
