@@ -27,12 +27,11 @@ from pydantic import BaseModel, Field
 from pydub import AudioSegment
 
 # ---------- Silenciar logs excessivos do ONNX Runtime ----------
-ort.set_default_logger_severity(4)  # FATAL apenas
+ort.set_default_logger_severity(4)
 logging.getLogger("onnxruntime").setLevel(logging.ERROR)
 
 # ---------- Logging da aplicação ----------
 class MemoryHandler(logging.Handler):
-    """Guarda as últimas N mensagens de log em memória (apenas WARNING+)."""
     def __init__(self, capacity=100):
         super().__init__()
         self.capacity = capacity
@@ -46,7 +45,6 @@ class MemoryHandler(logging.Handler):
 memory_handler = MemoryHandler(capacity=100)
 memory_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
 
-# Configura o logger raiz para mostrar apenas INFO no stdout e guardar WARNING+ no buffer
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -55,12 +53,11 @@ logging.basicConfig(
         memory_handler
     ]
 )
-# Reduz o nível dos handlers individuais se necessário (o StreamHandler já está INFO)
 logging.getLogger().handlers[0].setLevel(logging.INFO)
 memory_handler.setLevel(logging.WARNING)
 
 logger = logging.getLogger("piper-api")
-logger.setLevel(logging.DEBUG)  # permite debug internamente, mas os handlers filtram
+logger.setLevel(logging.DEBUG)
 
 # ---------- Variáveis de ambiente ----------
 MAX_GPU_JOBS = int(os.getenv("MAX_GPU_JOBS", "3"))
@@ -97,7 +94,6 @@ _thread_local = threading.local()
 _next_worker_id = 0
 _worker_id_lock = threading.Lock()
 
-# Contador de sínteses ativas
 active_synthesis_count = 0
 active_synthesis_lock = threading.Lock()
 
@@ -170,7 +166,7 @@ voices_registry: Dict[str, Dict] = {}
 class VoicePool:
     def __init__(self, model_path: str, config_path: str, pool_size: int = None):
         if pool_size is None:
-            pool_size = 1
+            pool_size = 1   # <--- CORRIGIDO PARA 1
         import queue
         self.pool = queue.Queue(maxsize=pool_size)
         for _ in range(pool_size):
@@ -207,7 +203,7 @@ def load_voice_from_folder(voice_name: str, voice_path: Path) -> dict:
         except:
             pass
 
-    pool = VoicePool(model_path, config_path, pool_size=GPU_WORKERS)
+    pool = VoicePool(model_path, config_path, pool_size=1)
     return {
         "model_path": model_path,
         "config_path": config_path,
@@ -233,7 +229,7 @@ def load_all_voices():
         json_file = onnx_file.with_suffix(".onnx.json")
         if json_file.exists():
             try:
-                pool = VoicePool(str(onnx_file), str(json_file), pool_size=GPU_WORKERS)
+                pool = VoicePool(str(onnx_file), str(json_file), pool_size=1)
                 voices_registry[name] = {
                     "model_path": str(onnx_file),
                     "config_path": str(json_file),
@@ -499,12 +495,13 @@ async def live():
 
 @app.get("/health")
 async def health():
-    return {
+    data = {
         "status": "ok",
         "gpu": True,
         "voices": list(voices_registry.keys()),
         "total": len(voices_registry)
     }
+    return Response(content=json.dumps(data, indent=2, ensure_ascii=False), media_type="application/json")
 
 # ---------- Benchmark ----------
 @app.get("/bench")
@@ -546,16 +543,16 @@ async def bench():
 async def get_stats():
     with stats_lock:
         if not stats:
-            return {"message": "Nenhuma requisição ainda."}
+            return Response(content=json.dumps({"message": "Nenhuma requisição ainda."}, indent=2), media_type="application/json")
         report = {}
         for key, values in stats.items():
             report[key] = compute_stats(values)
-        return report
+    return Response(content=json.dumps(report, indent=2, ensure_ascii=False), media_type="application/json")
 
 # ---------- Logs ----------
 @app.get("/logs")
 async def get_logs():
-    return {"logs": memory_handler.buffer}
+    return Response(content=json.dumps({"logs": memory_handler.buffer}, indent=2, ensure_ascii=False), media_type="application/json")
 
 # ---------- GPU ----------
 @app.get("/gpu")
@@ -566,7 +563,7 @@ async def gpu_diagnostics():
         nvidia_smi = subprocess.check_output(["nvidia-smi"], text=True)
     except Exception as e:
         nvidia_smi = str(e)
-    return {
+    data = {
         "onnxruntime_version": ort.__version__,
         "providers": providers,
         "device": ort.get_device(),
@@ -574,17 +571,19 @@ async def gpu_diagnostics():
         "ld_library_path": os.environ.get("LD_LIBRARY_PATH", ""),
         "voices_loaded": list(voices_registry.keys())
     }
+    return Response(content=json.dumps(data, indent=2, ensure_ascii=False), media_type="application/json")
 
 # ---------- Workers ----------
 @app.get("/workers")
 async def get_workers():
-    return {
+    data = {
         "tts_workers": GPU_WORKERS,
         "mix_workers": MIX_WORKERS,
         "max_gpu_jobs": MAX_GPU_JOBS,
         "active_gpu_jobs": active_synthesis_count,
         "per_worker": compute_worker_stats()
     }
+    return Response(content=json.dumps(data, indent=2, ensure_ascii=False), media_type="application/json")
 
 # ---------- Recursos ----------
 @app.get("/resources")
@@ -606,7 +605,7 @@ async def get_resources():
     except ImportError:
         pass
 
-    return {
+    data = {
         "gpu_utilization_percent": gpu_util,
         "cpu_utilization_percent": cpu_util,
         "cpu_cores_available": os.cpu_count(),
@@ -615,6 +614,7 @@ async def get_resources():
         "gpu_workers": GPU_WORKERS,
         "mix_workers": MIX_WORKERS
     }
+    return Response(content=json.dumps(data, indent=2, ensure_ascii=False), media_type="application/json")
 
 # ---------- Reset stats ----------
 @app.post("/reset_stats")
@@ -628,27 +628,28 @@ async def reset_stats():
         stats.clear()
     with worker_metrics_lock:
         worker_metrics.clear()
-    return {"message": "Estatísticas resetadas."}
+    return Response(content=json.dumps({"message": "Estatísticas resetadas."}, indent=2), media_type="application/json")
 
-# ---------- Teste de carga ----------
+# ---------- Teste de carga (leitura) ----------
 @app.get("/carga")
 async def get_carga():
     if not BENCH_DIR.exists():
-        return {"message": "Nenhum teste de carga foi executado ainda."}
+        return Response(content=json.dumps({"message": "Nenhum teste de carga foi executado ainda."}, indent=2), media_type="application/json")
 
     files = sorted(BENCH_DIR.glob("carga_results_*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
     if not files:
-        return {"message": "Nenhum ficheiro de carga encontrado."}
+        return Response(content=json.dumps({"message": "Nenhum ficheiro de carga encontrado."}, indent=2), media_type="application/json")
 
     latest_file = files[0]
     try:
         with open(latest_file, "r") as f:
             data = json.load(f)
-        return JSONResponse(content={
+        result = {
             "file": latest_file.name,
             "data": data,
             "available_files": [f.name for f in files]
-        }, media_type="application/json")
+        }
+        return Response(content=json.dumps(result, indent=2, ensure_ascii=False), media_type="application/json")
     except Exception as e:
         logger.error(f"Erro ao ler ficheiro de carga {latest_file}: {e}")
         raise HTTPException(500, "Erro ao ler ficheiro de carga.")
@@ -656,9 +657,9 @@ async def get_carga():
 @app.get("/carga_files")
 async def list_carga_files():
     if not BENCH_DIR.exists():
-        return {"files": []}
+        return Response(content=json.dumps({"files": []}, indent=2), media_type="application/json")
     files = sorted(BENCH_DIR.glob("carga_results_*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
-    return {"files": [f.name for f in files]}
+    return Response(content=json.dumps({"files": [f.name for f in files]}, indent=2), media_type="application/json")
 
 @app.get("/carga/{file_name}")
 async def get_specific_carga(file_name: str):
@@ -668,9 +669,134 @@ async def get_specific_carga(file_name: str):
     try:
         with open(file_path, "r") as f:
             data = json.load(f)
-        return JSONResponse(content=data, media_type="application/json")
+        return Response(content=json.dumps(data, indent=2, ensure_ascii=False), media_type="application/json")
     except Exception as e:
         raise HTTPException(500, f"Erro ao ler ficheiro: {e}")
+
+# ================= NOVO ENDPOINT: TESTE DE CARGA LOCAL =================
+@app.post("/run_load_test")
+async def run_load_test():
+    """Dispara um teste de carga local e guarda os resultados na pasta bench."""
+    import asyncio as aio
+    import aiohttp
+    import statistics
+    import random
+
+    RAMP_MAX_CONCURRENCY = 51
+    RAMP_STEP = 5
+    RAMP_STEP_DURATION = 30
+    REQUEST_TIMEOUT = 30
+    TEST_URL = "http://localhost:8000/synthesize"
+
+    PACIENTE_VOICE = "mulher_adulta"
+    AMBIENT_FILE = "ubs"
+    AMBIENT_VOLUME_DB = -5.0
+
+    DIALOGOS_BASE = [
+        "[paciente] Estou com dor de cabeça forte. Ele está assim há três dias, doutor.",
+        "[paciente] Tenho tido muita tosse, [tosse]... [tosse]..  febre desde ontem.",
+        "[paciente] Sinto falta de ar [inspiracao] ao caminhar. Ele já tem histórico de asma.",
+        "[paciente] Estou muito cansada [inspiracao] e com falta de ar.  Ela parou de fumar há um mês.",
+        "[paciente] A febre começou ontem à noite, depois que ele caiu.  Dói muito aqui!",
+        "[paciente] O remédio não está fazendo efeito. Ele está tomando dipirona, mas não melhora.",
+        "[paciente] Precisamos de uma receita para antibiótico.  Só dar o cu não está ajudando.",
+        "[paciente] Meu peito dói quando respiro fundo [inspiracao]. E ele chupou um pau de 25 centímetros?",
+        "[paciente] Quando posso voltar ao trabalho? Precisa de atestado por mais três dias.",
+        "[paciente] Ele está com os exames alterados.  Vou precisar de cirurgia?"
+    ]
+    EFEITOS_DISPONIVEIS = {
+        "[tosse]": "tosse.wav",
+        "[suspiro]": "suspiro.wav",
+        "[inspiracao]": "inspiracao.wav"
+    }
+
+    # Garantir que a pasta bench existe
+    BENCH_DIR.mkdir(exist_ok=True)
+
+    # Nome do ficheiro de saída
+    timestamp = int(time.time())
+    carga_file = BENCH_DIR / f"carga_results_local_{timestamp}.json"
+
+    results = []
+
+    logger.info("Iniciando teste de carga local...")
+
+    async with aiohttp.ClientSession() as session:
+        for concurrency in range(1, RAMP_MAX_CONCURRENCY + 1, RAMP_STEP):
+            logger.info(f"Testando com {concurrency} workers simultâneos...")
+            sem = aio.Semaphore(concurrency)
+            start_time = time.perf_counter()
+            success = 0
+            fail = 0
+            latencies = []
+
+            async def worker():
+                nonlocal success, fail, latencies
+                while time.perf_counter() - start_time < RAMP_STEP_DURATION:
+                    async with sem:
+                        dialogo = random.choice(DIALOGOS_BASE)
+                        payload = {
+                            "voice": PACIENTE_VOICE,
+                            "text": dialogo,
+                            "effects": EFEITOS_DISPONIVEIS,
+                            "ambient": {"enabled": True, "file": AMBIENT_FILE, "volume_db": AMBIENT_VOLUME_DB}
+                        }
+                        t0 = time.perf_counter()
+                        try:
+                            async with session.post(TEST_URL, json=payload,
+                                                   timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as resp:
+                                if resp.status == 200:
+                                    success += 1
+                                    latencies.append(time.perf_counter() - t0)
+                                else:
+                                    fail += 1
+                        except Exception:
+                            fail += 1
+                        await aio.sleep(0)
+
+            tasks = [aio.create_task(worker()) for _ in range(concurrency)]
+            await aio.sleep(RAMP_STEP_DURATION)
+            for task in tasks:
+                task.cancel()
+                try:
+                    await task
+                except aio.CancelledError:
+                    pass
+
+            total = success + fail
+            if latencies:
+                avg_lat = statistics.mean(latencies)
+                p95 = sorted(latencies)[int(0.95 * len(latencies))]
+            else:
+                avg_lat = 0.0
+                p95 = 0.0
+            throughput = success / RAMP_STEP_DURATION
+            error_rate = fail / total if total else 1.0
+
+            point = {
+                "concurrency": concurrency,
+                "throughput": throughput,
+                "avg_latency": avg_lat,
+                "p95_latency": p95,
+                "error_rate": error_rate,
+                "total_requests": total,
+                "success_count": success
+            }
+            results.append(point)
+            logger.info(f"  Throughput: {throughput:.2f} req/s | Latência média: {avg_lat:.3f}s | p95: {p95:.3f}s | Erros: {error_rate*100:.1f}%")
+
+            # Guardar incrementalmente
+            with open(carga_file, "w") as f:
+                json.dump(results, f, indent=2)
+
+    logger.info(f"Teste de carga local concluído. Resultados em {carga_file}")
+
+    return Response(content=json.dumps({
+        "message": "Teste de carga concluído.",
+        "file": carga_file.name,
+        "data": results
+    }, indent=2, ensure_ascii=False), media_type="application/json")
+
 
 if __name__ == "__main__":
     import uvicorn
