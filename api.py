@@ -170,7 +170,7 @@ voices_registry: Dict[str, Dict] = {}
 class VoicePool:
     def __init__(self, model_path: str, config_path: str, pool_size: int = None):
         if pool_size is None:
-            pool_size = GPU_WORKERS
+            pool_size = 1
         import queue
         self.pool = queue.Queue(maxsize=pool_size)
         for _ in range(pool_size):
