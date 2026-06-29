@@ -13,6 +13,8 @@ from typing import Dict, Optional, List, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict, deque
 from piper import PiperVoice, SynthesisConfig
+
+
 import numpy as np
 import onnxruntime as ort
 from fastapi import FastAPI, HTTPException
@@ -48,15 +50,16 @@ logging.basicConfig(
     ]
 )
 logging.getLogger().handlers[0].setLevel(logging.INFO)
-memory_handler.setLevel(logging.WARNING)
+# Capturar INFO no buffer de memória
+memory_handler.setLevel(logging.INFO)
 
 logger = logging.getLogger("piper-api")
 logger.setLevel(logging.DEBUG)
 
 # ---------- Variáveis de ambiente ----------
-MAX_GPU_JOBS = int(os.getenv("MAX_GPU_JOBS", "3"))
-GPU_WORKERS = int(os.getenv("GPU_WORKERS", "2"))
-MIX_WORKERS = int(os.getenv("MIX_WORKERS", "4"))
+MAX_GPU_JOBS = int(os.getenv("MAX_GPU_JOBS", "6"))
+GPU_WORKERS = int(os.getenv("GPU_WORKERS", "6"))
+MIX_WORKERS = int(os.getenv("MIX_WORKERS", "20"))
 
 SAMPLE_RATE_TARGET = 22050
 
@@ -543,7 +546,7 @@ async def get_stats():
             report[key] = compute_stats(values)
     return Response(content=json.dumps(report, indent=2, ensure_ascii=False), media_type="application/json")
 
-# ---------- Logs ----------
+# ---------- Logs (agora INFO incluído) ----------
 @app.get("/logs")
 async def get_logs():
     return Response(content=json.dumps({"logs": memory_handler.buffer}, indent=2, ensure_ascii=False), media_type="application/json")
@@ -671,14 +674,13 @@ async def get_specific_carga(file_name: str):
 @app.post("/run_load_test")
 async def run_load_test():
     """Dispara um teste de carga local e guarda os resultados na pasta bench."""
-    import asyncio as aio
     import aiohttp
     import statistics
     import random
 
-    RAMP_MAX_CONCURRENCY = 51
-    RAMP_STEP = 5
-    RAMP_STEP_DURATION = 30
+    RAMP_MAX_CONCURRENCY = 50
+    RAMP_STEP = 1
+    RAMP_STEP_DURATION = 60
     REQUEST_TIMEOUT = 30
     TEST_URL = "http://localhost:8000/synthesize"
 
@@ -704,13 +706,9 @@ async def run_load_test():
         "[inspiracao]": "inspiracao.wav"
     }
 
-    # Garantir que a pasta bench existe
     BENCH_DIR.mkdir(exist_ok=True)
-
-    # Nome do ficheiro de saída
     timestamp = int(time.time())
     carga_file = BENCH_DIR / f"carga_results_local_{timestamp}.json"
-
     results = []
 
     logger.info("Iniciando teste de carga local...")
@@ -718,7 +716,7 @@ async def run_load_test():
     async with aiohttp.ClientSession() as session:
         for concurrency in range(1, RAMP_MAX_CONCURRENCY + 1, RAMP_STEP):
             logger.info(f"Testando com {concurrency} workers simultâneos...")
-            sem = aio.Semaphore(concurrency)
+            sem = asyncio.Semaphore(concurrency)
             start_time = time.perf_counter()
             success = 0
             fail = 0
@@ -746,15 +744,15 @@ async def run_load_test():
                                     fail += 1
                         except Exception:
                             fail += 1
-                        await aio.sleep(0)
+                        await asyncio.sleep(0)
 
-            tasks = [aio.create_task(worker()) for _ in range(concurrency)]
-            await aio.sleep(RAMP_STEP_DURATION)
+            tasks = [asyncio.create_task(worker()) for _ in range(concurrency)]
+            await asyncio.sleep(RAMP_STEP_DURATION)
             for task in tasks:
                 task.cancel()
                 try:
                     await task
-                except aio.CancelledError:
+                except asyncio.CancelledError:
                     pass
 
             total = success + fail
@@ -779,7 +777,6 @@ async def run_load_test():
             results.append(point)
             logger.info(f"  Throughput: {throughput:.2f} req/s | Latência média: {avg_lat:.3f}s | p95: {p95:.3f}s | Erros: {error_rate*100:.1f}%")
 
-            # Guardar incrementalmente
             with open(carga_file, "w") as f:
                 json.dump(results, f, indent=2)
 
