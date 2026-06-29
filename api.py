@@ -163,7 +163,7 @@ voices_registry: Dict[str, Dict] = {}
 class VoicePool:
     def __init__(self, model_path: str, config_path: str, pool_size: int = None):
         if pool_size is None:
-            pool_size = 1   # <--- CORRIGIDO PARA 1
+            pool_size = 2   # <--- CORRIGIDO PARA 1
         import queue
         self.pool = queue.Queue(maxsize=pool_size)
         for _ in range(pool_size):
@@ -589,6 +589,7 @@ async def get_workers():
 # ---------- Recursos ----------
 @app.get("/resources")
 async def get_resources():
+    # Utilização da GPU via nvidia-smi
     gpu_util = -1.0
     try:
         out = subprocess.check_output(
@@ -599,6 +600,7 @@ async def get_resources():
     except Exception:
         pass
 
+    # Utilização da CPU (psutil opcional)
     cpu_util = -1.0
     try:
         import psutil
@@ -606,11 +608,14 @@ async def get_resources():
     except ImportError:
         pass
 
+    # Limitar o contador de sínteses ativas ao máximo permitido
+    safe_active = min(active_synthesis_count, MAX_GPU_JOBS)
+
     data = {
         "gpu_utilization_percent": gpu_util,
         "cpu_utilization_percent": cpu_util,
         "cpu_cores_available": os.cpu_count(),
-        "active_gpu_jobs": active_synthesis_count,
+        "active_gpu_jobs": safe_active,
         "max_gpu_jobs": MAX_GPU_JOBS,
         "gpu_workers": GPU_WORKERS,
         "mix_workers": MIX_WORKERS
