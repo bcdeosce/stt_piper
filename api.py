@@ -12,13 +12,7 @@ from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict, deque
-
-try:
-    from piper import PiperVoice, SynthesisConfig
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "piper-tts"])
-    from piper import PiperVoice, SynthesisConfig
-
+from piper import PiperVoice, SynthesisConfig
 import numpy as np
 import onnxruntime as ort
 from fastapi import FastAPI, HTTPException
