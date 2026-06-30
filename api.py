@@ -1,4 +1,9 @@
+# -*- coding: utf-8 -*-
 import os
+# 🔧 Forçar uma única thread ONNX / OpenMP para evitar contenção de CPU
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("ORT_NUM_THREADS", "1")
+
 import re
 import sys
 import time
@@ -8,7 +13,7 @@ import subprocess
 import threading
 import asyncio
 import io
-import queue                          # <--- ESSENCIAL para VoicePool
+import queue
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor
@@ -49,10 +54,7 @@ memory_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(mes
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        memory_handler
-    ]
+    handlers=[logging.StreamHandler(sys.stdout), memory_handler]
 )
 logging.getLogger().handlers[0].setLevel(logging.INFO)
 memory_handler.setLevel(logging.INFO)
@@ -166,7 +168,7 @@ gpu_semaphore: asyncio.Semaphore = None
 gpu_executor: ThreadPoolExecutor = None
 mix_executor: ThreadPoolExecutor = None
 
-# ========== NOVA POOL DE VOZES HÍBRIDA ==========
+# ========== POOL DE VOZES HÍBRIDA (com expansão total) ==========
 class VoicePool:
     def __init__(self, model_path: str, config_path: str):
         self.model_path = model_path
@@ -176,7 +178,7 @@ class VoicePool:
         self.extra_ttl = POOL_EXTRA_TTL_MINUTES * 60.0
         self.pool = queue.Queue()
         self._lock = threading.Lock()
-        self._extra_instances: List[Tuple[Any, float]] = []
+        self._extra_instances: list[Tuple[Any, float]] = []
         self._expansion_executor = ThreadPoolExecutor(max_workers=2)
         self._expansion_in_progress = False
 
@@ -185,11 +187,11 @@ class VoicePool:
             voice = PiperVoice.load(self.model_path, self.config_path, use_cuda=True)
             self.pool.put(voice)
 
-        # Thread de limpeza periódica das instâncias extra expiradas
+        # Limpeza periódica mais agressiva (15s)
         if self.extra_ttl > 0:
             def cleaner():
                 while True:
-                    time.sleep(30)
+                    time.sleep(15)
                     self._remove_expired_extras()
             threading.Thread(target=cleaner, daemon=True).start()
 
@@ -198,16 +200,22 @@ class VoicePool:
         self.pool.put(voice)
         return voice
 
-    def _create_extra_instances(self, count: int):
+    def _expand_to_max(self):
+        """Cria imediatamente todas as instâncias que faltam até ao máximo."""
+        with self._lock:
+            current_total = self.pool.qsize() + len(self._extra_instances)
+            needed = self.max_size - current_total
+            if needed <= 0 or self._expansion_in_progress:
+                return
+            self._expansion_in_progress = True
+
         def _create_and_register():
-            for _ in range(count):
-                with self._lock:
-                    current_total = self.pool.qsize() + len(self._extra_instances)
-                    if current_total >= self.max_size:
-                        break
+            for _ in range(needed):
                 voice = self._create_instance()
                 with self._lock:
                     self._extra_instances.append((voice, time.time()))
+            with self._lock:
+                self._expansion_in_progress = False
         self._expansion_executor.submit(_create_and_register)
 
     def _remove_expired_extras(self):
@@ -225,16 +233,8 @@ class VoicePool:
         try:
             return self.pool.get(timeout=timeout)
         except queue.Empty:
-            # Expansão em background se necessário
-            with self._lock:
-                current_total = self.pool.qsize() + len(self._extra_instances)
-                if current_total < self.max_size and not self._expansion_in_progress:
-                    self._expansion_in_progress = True
-                    needed = min(self.max_size - current_total, 4)
-                    if needed > 0:
-                        self._create_extra_instances(needed)
-                    self._expansion_in_progress = False
-            # Tenta novamente
+            # Expansão total em background
+            self._expand_to_max()
             return self.pool.get(timeout=timeout)
 
     def put(self, voice):
@@ -451,16 +451,15 @@ async def startup():
     gpu_semaphore = asyncio.Semaphore(MAX_GPU_JOBS)
     gpu_executor = ThreadPoolExecutor(max_workers=GPU_WORKERS)
     mix_executor = ThreadPoolExecutor(max_workers=MIX_WORKERS)
-    logger.info(f"Sistema pronto. Workers GPU={GPU_WORKERS}, Mix={MIX_WORKERS}, MaxGPU={MAX_GPU_JOBS}, PoolInit={POOL_INIT_SIZE}, PoolMax={POOL_MAX_SIZE}")
-
-    # Reset periódico manual (se configurado)
+    logger.info(f"Sistema pronto. Workers GPU={GPU_WORKERS}, Mix={MIX_WORKERS}, MaxGPU={MAX_GPU_JOBS}, "
+                f"PoolInit={POOL_INIT_SIZE}, PoolMax={POOL_MAX_SIZE}")
     if POOL_RESET_MINUTES > 0:
         async def periodic_reset():
             while True:
                 await asyncio.sleep(POOL_RESET_MINUTES * 60)
                 for entry in voices_registry.values():
                     entry["pool"].reset()
-                logger.info(f"Reset periódico das pools ({POOL_RESET_MINUTES} min) concluído")
+                logger.info(f"Reset periódico das pools ({POOL_RESET_MINUTES} min)")
         asyncio.create_task(periodic_reset())
 
 # ================= ENDPOINT DE SÍNTESE =================
@@ -623,7 +622,9 @@ async def bench():
                 "MIX_WORKERS": MIX_WORKERS,
                 "POOL_INIT_SIZE": POOL_INIT_SIZE,
                 "POOL_MAX_SIZE": POOL_MAX_SIZE,
-                "POOL_EXTRA_TTL_MINUTES": POOL_EXTRA_TTL_MINUTES
+                "POOL_EXTRA_TTL_MINUTES": POOL_EXTRA_TTL_MINUTES,
+                "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "1"),
+                "ORT_NUM_THREADS": os.environ.get("ORT_NUM_THREADS", "1"),
             },
             "gpu": True,
             "precision": "fp32",
@@ -712,6 +713,21 @@ async def get_resources():
         "mix_workers": MIX_WORKERS
     }
     return Response(content=json.dumps(data, indent=2, ensure_ascii=False), media_type="application/json")
+
+# ---------- Threads (diagnóstico) ----------
+@app.get("/threads")
+async def thread_info():
+    try:
+        import psutil
+        p = psutil.Process()
+        threads = p.num_threads()
+    except ImportError:
+        threads = threading.active_count()
+    return {
+        "process_threads": threads,
+        "active_threads": threading.active_count(),
+        "cpu_cores": os.cpu_count()
+    }
 
 # ---------- Reset das pools (manual) ----------
 @app.post("/reset_pools")
