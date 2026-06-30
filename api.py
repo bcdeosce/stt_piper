@@ -65,8 +65,9 @@ GPU_WORKERS = int(os.getenv("GPU_WORKERS", "2"))
 MIX_WORKERS = int(os.getenv("MIX_WORKERS", "4"))
 
 POOL_INIT_SIZE = int(os.getenv("POOL_INIT_SIZE", "1"))
-POOL_MAX_SIZE  = int(os.getenv("POOL_MAX_SIZE", str(GPU_WORKERS)))   # máximo = GPU_WORKERS
-POOL_RESET_MINUTES = float(os.getenv("POOL_RESET_MINUTES", "15"))    # 0 = desativado
+POOL_MAX_SIZE  = int(os.getenv("POOL_MAX_SIZE", str(GPU_WORKERS)))
+POOL_EXTRA_TTL_MINUTES = float(os.getenv("POOL_EXTRA_TTL_MINUTES", "15"))
+POOL_RESET_MINUTES = float(os.getenv("POOL_RESET_MINUTES", "0"))   # 0 = desativado
 
 SAMPLE_RATE_TARGET = 22050
 
@@ -164,53 +165,93 @@ gpu_semaphore: asyncio.Semaphore = None
 gpu_executor: ThreadPoolExecutor = None
 mix_executor: ThreadPoolExecutor = None
 
-# ---------- Pool de vozes elástica ----------
+# ========== NOVA POOL DE VOZES HÍBRIDA ==========
 class VoicePool:
     def __init__(self, model_path: str, config_path: str):
         self.model_path = model_path
         self.config_path = config_path
         self.init_size = POOL_INIT_SIZE
         self.max_size = POOL_MAX_SIZE
-        self.current_size = 0
-        import queue
+        self.extra_ttl = POOL_EXTRA_TTL_MINUTES * 60.0
         self.pool = queue.Queue()
         self._lock = threading.Lock()
-        # Criar instâncias iniciais
+        self._extra_instances: list[Tuple[Any, float]] = []
+        self._expansion_executor = ThreadPoolExecutor(max_workers=2)
+        self._expansion_in_progress = False
+
+        # Criar instâncias base
         for _ in range(self.init_size):
-            self._create_instance()
+            voice = PiperVoice.load(self.model_path, self.config_path, use_cuda=True)
+            self.pool.put(voice)
+
+        # Thread de limpeza periódica das instâncias extra expiradas
+        if self.extra_ttl > 0:
+            def cleaner():
+                while True:
+                    time.sleep(30)
+                    self._remove_expired_extras()
+            threading.Thread(target=cleaner, daemon=True).start()
 
     def _create_instance(self):
         voice = PiperVoice.load(self.model_path, self.config_path, use_cuda=True)
         self.pool.put(voice)
-        self.current_size += 1
+        return voice
+
+    def _create_extra_instances(self, count: int):
+        def _create_and_register():
+            for _ in range(count):
+                with self._lock:
+                    current_total = self.pool.qsize() + len(self._extra_instances)
+                    if current_total >= self.max_size:
+                        break
+                voice = self._create_instance()
+                with self._lock:
+                    self._extra_instances.append((voice, time.time()))
+        self._expansion_executor.submit(_create_and_register)
+
+    def _remove_expired_extras(self):
+        with self._lock:
+            now = time.time()
+            surviving = []
+            for voice, created in self._extra_instances:
+                if now - created > self.extra_ttl:
+                    voice._expired = True   # será descartada quando devolvida
+                else:
+                    surviving.append((voice, created))
+            self._extra_instances = surviving
 
     def get(self, timeout=10.0):
         try:
             return self.pool.get(timeout=timeout)
-        except Exception:   # queue.Empty ou qualquer outro erro
-            # Se não há disponível, tenta criar uma nova se ainda não atingiu o máximo
+        except queue.Empty:
+            # Expansão em background se necessário
             with self._lock:
-                if self.current_size < self.max_size:
-                    self._create_instance()
-            # Tenta novamente
+                current_total = self.pool.qsize() + len(self._extra_instances)
+                if current_total < self.max_size and not self._expansion_in_progress:
+                    self._expansion_in_progress = True
+                    needed = min(self.max_size - current_total, 4)
+                    if needed > 0:
+                        self._create_extra_instances(needed)
+                    self._expansion_in_progress = False
+            # Tenta novamente (a expansão pode já ter colocado novas instâncias)
             return self.pool.get(timeout=timeout)
 
     def put(self, voice):
+        if hasattr(voice, '_expired') and voice._expired:
+            return
         self.pool.put(voice)
 
     def reset(self):
-        """Remove todas as instâncias e recria apenas as iniciais (liberta VRAM)."""
         with self._lock:
-            # Esvaziar a pool sem chamar get bloqueante
             while True:
                 try:
-                    self.pool.get_nowait()
-                except Exception:
+                    v = self.pool.get_nowait()
+                    v._expired = True
+                except queue.Empty:
                     break
-            self.current_size = 0
+            self._extra_instances.clear()
             for _ in range(self.init_size):
                 self._create_instance()
-        logger.info(f"Pool resetada para voz (path={self.model_path})")
 
 # ---------- Registro de vozes ----------
 voices_registry: Dict[str, Dict] = {}
@@ -239,7 +280,7 @@ def load_voice_from_folder(voice_name: str, voice_path: Path) -> dict:
         except:
             pass
 
-    pool = VoicePool(model_path, config_path)   # <-- agora sem pool_size
+    pool = VoicePool(model_path, config_path)
     return {
         "model_path": model_path,
         "config_path": config_path,
@@ -265,7 +306,6 @@ def load_all_voices():
         json_file = onnx_file.with_suffix(".onnx.json")
         if json_file.exists():
             try:
-                # Vozes soltas também usam VoicePool
                 pool = VoicePool(str(onnx_file), str(json_file))
                 voices_registry[name] = {
                     "model_path": str(onnx_file),
@@ -289,7 +329,7 @@ def synthesize_text(voice_name: str, text: str, speed: float,
 
     pool = voices_registry[voice_name]["pool"]
     t_pool_start = time.perf_counter()
-    voice = pool.get()          # timeout incluído
+    voice = pool.get()
     t_pool_end = time.perf_counter()
     pool_wait = t_pool_end - t_pool_start
     try:
@@ -410,14 +450,14 @@ async def startup():
     gpu_semaphore = asyncio.Semaphore(MAX_GPU_JOBS)
     gpu_executor = ThreadPoolExecutor(max_workers=GPU_WORKERS)
     mix_executor = ThreadPoolExecutor(max_workers=MIX_WORKERS)
-    logger.info(f"Sistema pronto. Workers GPU={GPU_WORKERS}, Mix={MIX_WORKERS}, MaxGPU={MAX_GPU_JOBS}")
+    logger.info(f"Sistema pronto. Workers GPU={GPU_WORKERS}, Mix={MIX_WORKERS}, MaxGPU={MAX_GPU_JOBS}, PoolInit={POOL_INIT_SIZE}, PoolMax={POOL_MAX_SIZE}")
 
-    # Iniciar reset periódico se configurado
+    # Reset periódico manual (se configurado)
     if POOL_RESET_MINUTES > 0:
         async def periodic_reset():
             while True:
                 await asyncio.sleep(POOL_RESET_MINUTES * 60)
-                for voice_name, entry in voices_registry.items():
+                for entry in voices_registry.values():
                     entry["pool"].reset()
                 logger.info(f"Reset periódico das pools ({POOL_RESET_MINUTES} min) concluído")
         asyncio.create_task(periodic_reset())
@@ -582,7 +622,7 @@ async def bench():
                 "MIX_WORKERS": MIX_WORKERS,
                 "POOL_INIT_SIZE": POOL_INIT_SIZE,
                 "POOL_MAX_SIZE": POOL_MAX_SIZE,
-                "POOL_RESET_MINUTES": POOL_RESET_MINUTES
+                "POOL_EXTRA_TTL_MINUTES": POOL_EXTRA_TTL_MINUTES
             },
             "gpu": True,
             "precision": "fp32",
@@ -675,7 +715,7 @@ async def get_resources():
 # ---------- Reset das pools (manual) ----------
 @app.post("/reset_pools")
 async def reset_pools():
-    for voice_name, entry in voices_registry.items():
+    for entry in voices_registry.values():
         entry["pool"].reset()
     return Response(content=json.dumps({"message": "Pools resetadas"}, indent=2), media_type="application/json")
 
