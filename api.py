@@ -8,6 +8,7 @@ import subprocess
 import threading
 import asyncio
 import io
+import queue                          # <--- ESSENCIAL para VoicePool
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor
@@ -67,7 +68,7 @@ MIX_WORKERS = int(os.getenv("MIX_WORKERS", "4"))
 POOL_INIT_SIZE = int(os.getenv("POOL_INIT_SIZE", "1"))
 POOL_MAX_SIZE  = int(os.getenv("POOL_MAX_SIZE", str(GPU_WORKERS)))
 POOL_EXTRA_TTL_MINUTES = float(os.getenv("POOL_EXTRA_TTL_MINUTES", "15"))
-POOL_RESET_MINUTES = float(os.getenv("POOL_RESET_MINUTES", "0"))   # 0 = desativado
+POOL_RESET_MINUTES = float(os.getenv("POOL_RESET_MINUTES", "0"))
 
 SAMPLE_RATE_TARGET = 22050
 
@@ -175,7 +176,7 @@ class VoicePool:
         self.extra_ttl = POOL_EXTRA_TTL_MINUTES * 60.0
         self.pool = queue.Queue()
         self._lock = threading.Lock()
-        self._extra_instances: list[Tuple[Any, float]] = []
+        self._extra_instances: List[Tuple[Any, float]] = []
         self._expansion_executor = ThreadPoolExecutor(max_workers=2)
         self._expansion_in_progress = False
 
@@ -215,7 +216,7 @@ class VoicePool:
             surviving = []
             for voice, created in self._extra_instances:
                 if now - created > self.extra_ttl:
-                    voice._expired = True   # será descartada quando devolvida
+                    voice._expired = True
                 else:
                     surviving.append((voice, created))
             self._extra_instances = surviving
@@ -233,7 +234,7 @@ class VoicePool:
                     if needed > 0:
                         self._create_extra_instances(needed)
                     self._expansion_in_progress = False
-            # Tenta novamente (a expansão pode já ter colocado novas instâncias)
+            # Tenta novamente
             return self.pool.get(timeout=timeout)
 
     def put(self, voice):
