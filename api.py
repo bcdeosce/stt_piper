@@ -12,8 +12,12 @@ from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict, deque
-from piper import PiperVoice, SynthesisConfig
 
+try:
+    from piper import PiperVoice, SynthesisConfig
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "piper-tts"])
+    from piper import PiperVoice, SynthesisConfig
 
 import numpy as np
 import onnxruntime as ort
@@ -50,16 +54,19 @@ logging.basicConfig(
     ]
 )
 logging.getLogger().handlers[0].setLevel(logging.INFO)
-# Capturar INFO no buffer de memória
 memory_handler.setLevel(logging.INFO)
 
 logger = logging.getLogger("piper-api")
 logger.setLevel(logging.DEBUG)
 
 # ---------- Variáveis de ambiente ----------
-MAX_GPU_JOBS = int(os.getenv("MAX_GPU_JOBS", "6"))
-GPU_WORKERS = int(os.getenv("GPU_WORKERS", "6"))
-MIX_WORKERS = int(os.getenv("MIX_WORKERS", "20"))
+MAX_GPU_JOBS = int(os.getenv("MAX_GPU_JOBS", "3"))
+GPU_WORKERS = int(os.getenv("GPU_WORKERS", "2"))
+MIX_WORKERS = int(os.getenv("MIX_WORKERS", "4"))
+
+POOL_INIT_SIZE = int(os.getenv("POOL_INIT_SIZE", "1"))
+POOL_MAX_SIZE  = int(os.getenv("POOL_MAX_SIZE", str(GPU_WORKERS)))   # máximo = GPU_WORKERS
+POOL_RESET_MINUTES = float(os.getenv("POOL_RESET_MINUTES", "15"))    # 0 = desativado
 
 SAMPLE_RATE_TARGET = 22050
 
@@ -157,24 +164,56 @@ gpu_semaphore: asyncio.Semaphore = None
 gpu_executor: ThreadPoolExecutor = None
 mix_executor: ThreadPoolExecutor = None
 
-# ---------- Registro de vozes ----------
-voices_registry: Dict[str, Dict] = {}
-
+# ---------- Pool de vozes elástica ----------
 class VoicePool:
-    def __init__(self, model_path: str, config_path: str, pool_size: int = None):
-        if pool_size is None:
-            pool_size = 2   # <--- CORRIGIDO PARA 1
+    def __init__(self, model_path: str, config_path: str):
+        self.model_path = model_path
+        self.config_path = config_path
+        self.init_size = POOL_INIT_SIZE
+        self.max_size = POOL_MAX_SIZE
+        self.current_size = 0
         import queue
-        self.pool = queue.Queue(maxsize=pool_size)
-        for _ in range(pool_size):
-            voice = PiperVoice.load(model_path, config_path=config_path, use_cuda=True)
-            self.pool.put(voice)
+        self.pool = queue.Queue()
+        self._lock = threading.Lock()
+        # Criar instâncias iniciais
+        for _ in range(self.init_size):
+            self._create_instance()
 
-    def get(self, timeout=2.0):
-        return self.pool.get(timeout=timeout)
+    def _create_instance(self):
+        voice = PiperVoice.load(self.model_path, self.config_path, use_cuda=True)
+        self.pool.put(voice)
+        self.current_size += 1
+
+    def get(self, timeout=10.0):
+        try:
+            return self.pool.get(timeout=timeout)
+        except Exception:   # queue.Empty ou qualquer outro erro
+            # Se não há disponível, tenta criar uma nova se ainda não atingiu o máximo
+            with self._lock:
+                if self.current_size < self.max_size:
+                    self._create_instance()
+            # Tenta novamente
+            return self.pool.get(timeout=timeout)
 
     def put(self, voice):
         self.pool.put(voice)
+
+    def reset(self):
+        """Remove todas as instâncias e recria apenas as iniciais (liberta VRAM)."""
+        with self._lock:
+            # Esvaziar a pool sem chamar get bloqueante
+            while True:
+                try:
+                    self.pool.get_nowait()
+                except Exception:
+                    break
+            self.current_size = 0
+            for _ in range(self.init_size):
+                self._create_instance()
+        logger.info(f"Pool resetada para voz (path={self.model_path})")
+
+# ---------- Registro de vozes ----------
+voices_registry: Dict[str, Dict] = {}
 
 def load_voice_from_folder(voice_name: str, voice_path: Path) -> dict:
     onnx_files = list(voice_path.glob("*.onnx"))
@@ -200,7 +239,7 @@ def load_voice_from_folder(voice_name: str, voice_path: Path) -> dict:
         except:
             pass
 
-    pool = VoicePool(model_path, config_path, pool_size=1)
+    pool = VoicePool(model_path, config_path)   # <-- agora sem pool_size
     return {
         "model_path": model_path,
         "config_path": config_path,
@@ -226,7 +265,8 @@ def load_all_voices():
         json_file = onnx_file.with_suffix(".onnx.json")
         if json_file.exists():
             try:
-                pool = VoicePool(str(onnx_file), str(json_file), pool_size=1)
+                # Vozes soltas também usam VoicePool
+                pool = VoicePool(str(onnx_file), str(json_file))
                 voices_registry[name] = {
                     "model_path": str(onnx_file),
                     "config_path": str(json_file),
@@ -241,14 +281,15 @@ def load_all_voices():
     logger.info(f"Total de vozes carregadas: {len(voices_registry)}")
 
 # ---------- Síntese de um fragmento ----------
-def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
+def synthesize_text(voice_name: str, text: str, speed: float,
+                    noise_scale: float, noise_w_scale: float):
     global active_synthesis_count
     with active_synthesis_lock:
         active_synthesis_count += 1
 
     pool = voices_registry[voice_name]["pool"]
     t_pool_start = time.perf_counter()
-    voice = pool.get()
+    voice = pool.get()          # timeout incluído
     t_pool_end = time.perf_counter()
     pool_wait = t_pool_end - t_pool_start
     try:
@@ -265,7 +306,6 @@ def synthesize_text(voice_name, text, speed, noise_scale, noise_w_scale):
         record_worker_job(synth_time)
         return sample_rate, audio_bytes, pool_wait
     except Exception:
-        # Se algo falhar, devolvemos um segmento vazio para não quebrar o fluxo
         logger.exception("Erro na síntese de um fragmento")
         return 22050, b"", pool_wait
     finally:
@@ -371,6 +411,16 @@ async def startup():
     gpu_executor = ThreadPoolExecutor(max_workers=GPU_WORKERS)
     mix_executor = ThreadPoolExecutor(max_workers=MIX_WORKERS)
     logger.info(f"Sistema pronto. Workers GPU={GPU_WORKERS}, Mix={MIX_WORKERS}, MaxGPU={MAX_GPU_JOBS}")
+
+    # Iniciar reset periódico se configurado
+    if POOL_RESET_MINUTES > 0:
+        async def periodic_reset():
+            while True:
+                await asyncio.sleep(POOL_RESET_MINUTES * 60)
+                for voice_name, entry in voices_registry.items():
+                    entry["pool"].reset()
+                logger.info(f"Reset periódico das pools ({POOL_RESET_MINUTES} min) concluído")
+        asyncio.create_task(periodic_reset())
 
 # ================= ENDPOINT DE SÍNTESE =================
 @app.post("/synthesize", response_class=Response)
@@ -529,7 +579,10 @@ async def bench():
             "workers": {
                 "MAX_GPU_JOBS": MAX_GPU_JOBS,
                 "GPU_WORKERS": GPU_WORKERS,
-                "MIX_WORKERS": MIX_WORKERS
+                "MIX_WORKERS": MIX_WORKERS,
+                "POOL_INIT_SIZE": POOL_INIT_SIZE,
+                "POOL_MAX_SIZE": POOL_MAX_SIZE,
+                "POOL_RESET_MINUTES": POOL_RESET_MINUTES
             },
             "gpu": True,
             "precision": "fp32",
@@ -550,7 +603,7 @@ async def get_stats():
             report[key] = compute_stats(values)
     return Response(content=json.dumps(report, indent=2, ensure_ascii=False), media_type="application/json")
 
-# ---------- Logs (agora INFO incluído) ----------
+# ---------- Logs ----------
 @app.get("/logs")
 async def get_logs():
     return Response(content=json.dumps({"logs": memory_handler.buffer}, indent=2, ensure_ascii=False), media_type="application/json")
@@ -589,7 +642,6 @@ async def get_workers():
 # ---------- Recursos ----------
 @app.get("/resources")
 async def get_resources():
-    # Utilização da GPU via nvidia-smi
     gpu_util = -1.0
     try:
         out = subprocess.check_output(
@@ -600,7 +652,6 @@ async def get_resources():
     except Exception:
         pass
 
-    # Utilização da CPU (psutil opcional)
     cpu_util = -1.0
     try:
         import psutil
@@ -608,7 +659,6 @@ async def get_resources():
     except ImportError:
         pass
 
-    # Limitar o contador de sínteses ativas ao máximo permitido
     safe_active = min(active_synthesis_count, MAX_GPU_JOBS)
 
     data = {
@@ -621,6 +671,13 @@ async def get_resources():
         "mix_workers": MIX_WORKERS
     }
     return Response(content=json.dumps(data, indent=2, ensure_ascii=False), media_type="application/json")
+
+# ---------- Reset das pools (manual) ----------
+@app.post("/reset_pools")
+async def reset_pools():
+    for voice_name, entry in voices_registry.items():
+        entry["pool"].reset()
+    return Response(content=json.dumps({"message": "Pools resetadas"}, indent=2), media_type="application/json")
 
 # ---------- Reset stats ----------
 @app.post("/reset_stats")
@@ -687,9 +744,9 @@ async def run_load_test():
     import statistics
     import random
 
-    RAMP_MAX_CONCURRENCY = 50
-    RAMP_STEP = 1
-    RAMP_STEP_DURATION = 60
+    RAMP_MAX_CONCURRENCY = 51
+    RAMP_STEP = 5
+    RAMP_STEP_DURATION = 30
     REQUEST_TIMEOUT = 30
     TEST_URL = "http://localhost:8000/synthesize"
 
