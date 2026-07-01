@@ -14,6 +14,13 @@ from typing import Dict, Optional, List, Tuple, Any
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from collections import defaultdict, deque
 
+# ========== INSTALAR PSUTIL SE NÃO EXISTIR ==========
+try:
+    import psutil
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "psutil"])
+    import psutil
+
 # ========== FORÇA 1 THREAD NO ONNX RUNTIME ==========
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["ORT_NUM_THREADS"] = "1"
@@ -42,7 +49,7 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "piper-tts"])
     from piper import PiperVoice, SynthesisConfig
 
-# ---------- Logging configurável ----------
+# ---------- Logging ----------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 ort.set_default_logger_severity(4)
 logging.getLogger("onnxruntime").setLevel(logging.ERROR)
@@ -60,7 +67,7 @@ memory_handler = MemoryHandler(capacity=100)
 memory_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
 logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s [%(levelname)s] %(message)s', handlers=[logging.StreamHandler(sys.stdout), memory_handler])
 logging.getLogger().handlers[0].setLevel(LOG_LEVEL)
-memory_handler.setLevel(logging.DEBUG)  # guarda tudo
+memory_handler.setLevel(logging.DEBUG)
 logger = logging.getLogger("piper-api")
 logger.setLevel(logging.DEBUG)
 
@@ -101,40 +108,60 @@ def compute_stats(values):
     arr = np.array(values)
     return {"mean":float(np.mean(arr)),"min":float(np.min(arr)),"max":float(np.max(arr)),"p95":float(np.percentile(arr,95)),"count":len(values)}
 
-# ====================== DETEÇÃO DE NÚCLEOS ======================
+# ====================== DETEÇÃO DE NÚCLEOS (ROBUSTA) ======================
 def _get_cores():
-    physical_logical, ht_logical = set(), set()
+    """Retorna (physical_cores, ht_cores) de forma segura."""
     try:
-        for i in range(os.cpu_count()):
+        physical_logical, ht_logical = set(), set()
+        total = os.cpu_count() or 4
+        for i in range(total):
             try:
                 with open(f'/sys/devices/system/cpu/cpu{i}/topology/thread_siblings_list') as f:
                     sibs = list(map(int, f.read().strip().split(',')))
-                    if len(sibs)>1 and i != sibs[0]: ht_logical.add(i)
-                    else: physical_logical.add(i)
+                    if len(sibs) > 1 and i != sibs[0]:
+                        ht_logical.add(i)
+                    else:
+                        physical_logical.add(i)
             except:
-                if i < os.cpu_count()//2: physical_logical.add(i)
-                else: ht_logical.add(i)
-    except: pass
-    return sorted(physical_logical), sorted(ht_logical)
+                if i < total // 2:
+                    physical_logical.add(i)
+                else:
+                    ht_logical.add(i)
+        if physical_logical and ht_logical:
+            return sorted(physical_logical), sorted(ht_logical)
+    except Exception as e:
+        logger.warning(f"Falha na deteção fina de núcleos: {e}")
+
+    # Fallback genérico
+    total = os.cpu_count() or 4
+    return list(range(total // 2)), list(range(total // 2, total))
 
 _PHYSICAL, _HT = _get_cores()
-def _parse_cores(var, default): return [int(x.strip()) for x in os.getenv(var,"").split(",")] if os.getenv(var) else default
+def _parse_cores(var, default):
+    val = os.getenv(var, "")
+    if val:
+        return [int(x.strip()) for x in val.split(",")]
+    return default
+
 TTS_CORES = _parse_cores("TTS_CORES", _HT[:TTS_WORKERS])
 CPU_CORES = _parse_cores("CPU_CORES", _HT[TTS_WORKERS:TTS_WORKERS+CPU_WORKERS])
 MIX_CORES = _parse_cores("MIX_CORES", _PHYSICAL[:MIX_WORKERS])
 
-logger.debug(f"Núcleos físicos: {_PHYSICAL}, HT: {_HT}")
-logger.debug(f"TTS_CORES: {TTS_CORES}, CPU_CORES: {CPU_CORES}, MIX_CORES: {MIX_CORES}")
+logger.info(f"Núcleos físicos detetados: {_PHYSICAL}, HT: {_HT}")
+logger.info(f"TTS_CORES (HT): {TTS_CORES}, CPU_CORES (HT): {CPU_CORES}, MIX_CORES (físicos): {MIX_CORES}")
 
-# ====================== POOL GPU (Processos) ======================
+# ====================== POOL GPU ======================
 _manager = mp.Manager()
 _tts_core_queue = _manager.Queue()
-for core in TTS_CORES: _tts_core_queue.put(core)
+for core in TTS_CORES:
+    _tts_core_queue.put(core)
 
 def _init_tts_worker():
     core = _tts_core_queue.get()
-    try: os.sched_setaffinity(0, {core})
-    except: pass
+    try:
+        os.sched_setaffinity(0, {core})
+    except Exception as e:
+        logger.warning(f"Falha ao fixar worker TTS no núcleo {core}: {e}")
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["ORT_NUM_THREADS"] = "1"
     import onnxruntime as _ort
