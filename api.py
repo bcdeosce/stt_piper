@@ -79,12 +79,12 @@ logger = logging.getLogger("piper-api")
 logger.setLevel(logging.DEBUG)
 
 # ---------- Variáveis de ambiente ----------
-MAX_GPU_JOBS = int(os.getenv("MAX_GPU_JOBS", "3"))
-GPU_WORKERS = int(os.getenv("GPU_WORKERS", "2"))   # será usado para TTS
-MIX_WORKERS = int(os.getenv("MIX_WORKERS", "4"))
+TTS_WORKERS = int(os.getenv("TTS_WORKERS", "6"))
+CPU_WORKERS = int(os.getenv("CPU_WORKERS", "3"))
+MIX_WORKERS = int(os.getenv("MIX_WORKERS", "2"))
 
 POOL_INIT_SIZE = int(os.getenv("POOL_INIT_SIZE", "1"))
-POOL_MAX_SIZE  = int(os.getenv("POOL_MAX_SIZE", str(GPU_WORKERS)))
+POOL_MAX_SIZE  = int(os.getenv("POOL_MAX_SIZE", str(TTS_WORKERS)))
 POOL_EXTRA_TTL_MINUTES = float(os.getenv("POOL_EXTRA_TTL_MINUTES", "15"))
 POOL_RESET_MINUTES = float(os.getenv("POOL_RESET_MINUTES", "0"))
 
@@ -112,47 +112,8 @@ bench_lock = threading.Lock()
 worker_metrics = defaultdict(lambda: {"count": 0, "total_synth_time": 0.0, "jobs": []})
 worker_metrics_lock = threading.Lock()
 
-_thread_local = threading.local()
-_next_worker_id = 0
-_worker_id_lock = threading.Lock()
-
-active_synthesis_count = 0
-active_synthesis_lock = threading.Lock()
-
-def get_worker_id():
-    if not hasattr(_thread_local, "worker_id"):
-        with _worker_id_lock:
-            global _next_worker_id
-            _thread_local.worker_id = _next_worker_id
-            _next_worker_id += 1
-    return _thread_local.worker_id
-
-def record_worker_job(synth_time: float):
-    wid = get_worker_id()
-    with worker_metrics_lock:
-        wm = worker_metrics[wid]
-        wm["count"] += 1
-        wm["total_synth_time"] += synth_time
-        wm["jobs"].append(synth_time)
-
-def compute_worker_stats():
-    with worker_metrics_lock:
-        stats = {}
-        for wid, data in worker_metrics.items():
-            jobs = data["jobs"]
-            if jobs:
-                arr = np.array(jobs)
-                stats[f"worker_{wid}"] = {
-                    "requests_processed": data["count"],
-                    "total_synth_time": data["total_synth_time"],
-                    "avg_synth_time": float(np.mean(arr)),
-                    "min_synth_time": float(np.min(arr)),
-                    "max_synth_time": float(np.max(arr)),
-                    "p95_synth_time": float(np.percentile(arr, 95)),
-                }
-            else:
-                stats[f"worker_{wid}"] = {"requests_processed": 0}
-        return stats
+_active_synthesis_count = 0
+_active_lock = threading.Lock()
 
 stats = defaultdict(list)
 stats_lock = threading.Lock()
@@ -176,48 +137,84 @@ def compute_stats(values: list[float]) -> dict:
         "count": len(values)
     }
 
-# ====================== PROCESS POOL PARA TTS ======================
-# Determinar núcleos físicos
-def _get_physical_cores():
+# ====================== DETEÇÃO DE NÚCLEOS ======================
+def _get_cores():
+    """Retorna duas listas: physical_cores, ht_cores (apenas os lógicos)."""
     physical = set()
+    all_logical = set()
     try:
         with open('/proc/cpuinfo') as f:
+            current_physical = None
             for line in f:
-                if line.startswith('core id'):
-                    physical.add(int(line.split(':')[1].strip()))
-    except Exception:
+                if line.startswith('processor'):
+                    current_logical = int(line.split(':')[1].strip())
+                    all_logical.add(current_logical)
+                elif line.startswith('core id'):
+                    current_physical = int(line.split(':')[1].strip())
+                    if current_physical is not None:
+                        physical.add(current_physical)
+    except:
         pass
+
     if not physical:
-        # fallback: usa os primeiros N núcleos lógicos
-        return list(range(os.cpu_count() // 2))
-    return sorted(physical)
+        total = os.cpu_count()
+        physical = set(range(total // 2))
+        all_logical = set(range(total))
 
-_PHYSICAL_CORES = _get_physical_cores()
-_NUM_PHYSICAL = len(_PHYSICAL_CORES)
+    # Os primeiros logicals de cada physical são os próprios físicos; os restantes são HT.
+    physical_logical = set()
+    ht_logical = set()
+    for logical in sorted(all_logical):
+        try:
+            with open(f'/sys/devices/system/cpu/cpu{logical}/topology/thread_siblings_list') as f:
+                siblings = list(map(int, f.read().strip().split(',')))
+                if len(siblings) > 1 and logical != siblings[0]:
+                    ht_logical.add(logical)
+                else:
+                    physical_logical.add(logical)
+        except:
+            # fallback: assume os primeiros metade são físicos
+            if logical < len(all_logical)//2:
+                physical_logical.add(logical)
+            else:
+                ht_logical.add(logical)
+    return sorted(physical_logical), sorted(ht_logical)
 
-TTS_WORKERS = int(os.getenv("TTS_WORKERS", str(_NUM_PHYSICAL)))
-MAX_GPU_JOBS = TTS_WORKERS   # o próprio pool já limita
+_PHYSICAL, _HT = _get_cores()
+logger.info(f"Núcleos físicos detetados: {_PHYSICAL}")
+logger.info(f"Hyper-threads detetados: {_HT}")
 
-# Fila de núcleos para os workers
+# Afinidades a partir das variáveis de ambiente ou deteção automática
+def _parse_cores(env_var, default_pool):
+    val = os.getenv(env_var, "")
+    if val:
+        return [int(x.strip()) for x in val.split(",")]
+    return default_pool
+
+TTS_CORES = _parse_cores("TTS_CORES", _HT[:TTS_WORKERS])
+CPU_CORES = _parse_cores("CPU_CORES", _HT[TTS_WORKERS:TTS_WORKERS+CPU_WORKERS])
+MIX_CORES = _parse_cores("MIX_CORES", _PHYSICAL[:MIX_WORKERS])
+
+logger.info(f"TTS_CORES (HT): {TTS_CORES}")
+logger.info(f"CPU_CORES (HT): {CPU_CORES}")
+logger.info(f"MIX_CORES (Físicos): {MIX_CORES}")
+
+# ====================== POOL DE PROCESSOS (GPU) ======================
 _manager = mp.Manager()
-_core_queue = _manager.Queue()
-for _core in _PHYSICAL_CORES:
-    _core_queue.put(_core)
+_tts_core_queue = _manager.Queue()
+for core in TTS_CORES:
+    _tts_core_queue.put(core)
 
-# Cache de vozes local aos processos (será preenchido pelos workers)
 def _init_tts_worker():
-    # Configurar afinidade
-    core = _core_queue.get()
+    core = _tts_core_queue.get()
     try:
         os.sched_setaffinity(0, {core})
     except Exception as e:
-        logger.warning(f"Falha ao fixar worker no núcleo {core}: {e}")
+        logger.warning(f"Falha ao fixar worker TTS no núcleo {core}: {e}")
 
-    # Reforçar 1 thread
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["ORT_NUM_THREADS"] = "1"
 
-    # Aplicar monkey patch no onnxruntime dentro deste processo
     import onnxruntime as _ort
     _original_ort_session = _ort.InferenceSession
     def _patched_ort_session(model_path, sess_options=None, providers=None, **kwargs):
@@ -229,47 +226,50 @@ def _init_tts_worker():
         return _original_ort_session(model_path, sess_options, providers=providers, **kwargs)
     _ort.InferenceSession = _patched_ort_session
 
-    # Inicializa o cache de vozes local ao processo
     import __main__
     __main__._worker_voice_cache = {}
 
-def _synthesize_text_worker(voice_name: str, text: str, speed: float,
-                            noise_scale: float, noise_w_scale: float):
-    """Função executada no ProcessPoolExecutor."""
+def _synthesize_text_worker(voice_name, phoneme_ids, scales_tuple):
+    """Executada no ProcessPoolExecutor: apenas inferência ONNX."""
     cache = getattr(sys.modules['__main__'], '_worker_voice_cache', None)
     if cache is None:
         cache = {}
         setattr(sys.modules['__main__'], '_worker_voice_cache', cache)
+
     if voice_name not in cache:
-        # Carregar voz – caminhos vêm do registo global (que está no processo principal)
-        # Precisamos de ter acesso ao VOICE_PATHS. Vamos passar como argumento ou usar uma variável global do módulo.
         model_path, config_path = _get_voice_paths(voice_name)
         voice = PiperVoice.load(model_path, config_path, use_cuda=True)
         cache[voice_name] = voice
     voice = cache[voice_name]
 
-    config = SynthesisConfig(
-        length_scale=speed,
-        noise_scale=noise_scale,
-        noise_w_scale=noise_w_scale,
-        volume=1.0
-    )
-    t0 = time.perf_counter()
-    chunk_generator = voice.synthesize(text, syn_config=config)
-    audio_bytes = b''.join(chunk.audio_int16_bytes for chunk in chunk_generator)
-    sample_rate = voice.config.sample_rate
-    synth_time = time.perf_counter() - t0
-    # Retornar também o PID para identificação do worker (opcional)
-    worker_id = os.getpid()
-    return sample_rate, audio_bytes, synth_time, worker_id
+    length_scale, noise_scale, noise_w = scales_tuple
+    # Constroi os tensores diretamente
+    phoneme_ids_array = np.expand_dims(np.array(phoneme_ids, dtype=np.int64), 0)
+    phoneme_ids_lengths = np.array([phoneme_ids_array.shape[1]], dtype=np.int64)
+    scales = np.array([noise_scale, length_scale, noise_w], dtype=np.float32)
 
-# Para que a função worker possa aceder aos caminhos das vozes, temos um dicionário global no módulo principal.
-# No arranque, preenchemos _VOICE_PATHS com os caminhos e usamos uma função auxiliar que será chamada pelos workers.
+    args = {
+        "input": phoneme_ids_array,
+        "input_lengths": phoneme_ids_lengths,
+        "scales": scales,
+    }
+    if voice.config.num_speakers > 1:
+        sid = np.array([0], dtype=np.int64)
+        args["sid"] = sid
+
+    t0 = time.perf_counter()
+    audio = voice.session.run(None, args)[0].squeeze()
+    audio = np.clip(audio * 32767, -32767, 32767).astype(np.int16)
+    synth_time = time.perf_counter() - t0
+
+    worker_id = os.getpid()
+    return voice.config.sample_rate, audio.tobytes(), synth_time, worker_id
+
+# Cache de caminhos das vozes (preenchido no processo principal)
 _VOICE_PATHS: Dict[str, Tuple[str, str]] = {}
 
 def _get_voice_paths(voice_name):
     if voice_name not in _VOICE_PATHS:
-        # Carrega do disco (backup)
         voice_path = VOICES_DIR / voice_name
         onnx_files = list(voice_path.glob("*.onnx"))
         if not onnx_files:
@@ -286,8 +286,8 @@ def _get_voice_paths(voice_name):
         _VOICE_PATHS[voice_name] = (model_path, config_path)
     return _VOICE_PATHS[voice_name]
 
-# ---------- Registro de vozes no processo principal ----------
-voices_registry: Dict[str, Dict] = {}   # apenas metadados
+# ---------- Registro de vozes (metadados) ----------
+voices_registry: Dict[str, Dict] = {}
 
 def load_voice_metadata(voice_name: str, voice_path: Path) -> dict:
     onnx_files = list(voice_path.glob("*.onnx"))
@@ -343,7 +343,21 @@ def load_all_voices_metadata():
 
     logger.info(f"Total de vozes registadas: {len(voices_registry)}")
 
-# ---------- Mixagem com pydub (processo principal) ----------
+# ---------- Fonemização (CPU) ----------
+def phonemize_and_ids(voice_name: str, text: str, speed: float,
+                      noise_scale: float, noise_w_scale: float):
+    """Executada no ThreadPoolExecutor da CPU: texto → IDs de fonemas."""
+    model_path, config_path = _get_voice_paths(voice_name)
+    # Podemos usar uma instância temporária apenas para fonemizar
+    with open(config_path, "r") as f:
+        config_dict = json.load(f)
+    voice = PiperVoice.load(model_path, config_path, use_cuda=False)  # CPU
+    phonemes = voice.phonemize(text)
+    phoneme_ids = voice.phonemes_to_ids(phonemes[0]) if phonemes else []
+    # Não precisamos da sessão GPU aqui
+    return voice_name, phoneme_ids, (speed, noise_scale, noise_w_scale)
+
+# ---------- Mixagem com pydub (ThreadPool) ----------
 def mix_and_concat(segments_data, ambient_cfg, target_rate=22050):
     t_start = time.perf_counter()
     combined = AudioSegment.empty()
@@ -432,19 +446,19 @@ class TTSRequest(BaseModel):
 # ---------- FastAPI ----------
 app = FastAPI(title="Piper TTS API (GPU)")
 
-# Pools globais (inicializados no startup)
+# Pools globais
 tts_pool: Optional[ProcessPoolExecutor] = None
+cpu_pool: Optional[ThreadPoolExecutor] = None
 mix_pool: Optional[ThreadPoolExecutor] = None
-gpu_semaphore: asyncio.Semaphore = None   # não será usado com processos; mantemos por compatibilidade, mas pode ser removido
 
 @app.on_event("startup")
 async def startup():
-    global tts_pool, mix_pool, gpu_semaphore
+    global tts_pool, cpu_pool, mix_pool
     load_all_voices_metadata()
     tts_pool = ProcessPoolExecutor(max_workers=TTS_WORKERS, initializer=_init_tts_worker)
+    cpu_pool = ThreadPoolExecutor(max_workers=CPU_WORKERS)
     mix_pool = ThreadPoolExecutor(max_workers=MIX_WORKERS)
-    gpu_semaphore = asyncio.Semaphore(MAX_GPU_JOBS)
-    logger.info(f"Sistema pronto. TTS workers={TTS_WORKERS}, Mix={MIX_WORKERS}, MaxGPU={MAX_GPU_JOBS}")
+    logger.info(f"Sistema pronto. TTS={TTS_WORKERS}, CPU={CPU_WORKERS}, MIX={MIX_WORKERS}")
 
 # ================= ENDPOINT DE SÍNTESE =================
 @app.post("/synthesize", response_class=Response)
@@ -471,27 +485,24 @@ async def synthesize(req: TTSRequest):
     parts = re.split(r'(\[.*?\])', req.text)
     current_role = None
     segments_data = []
-    tts_start = None
-    tts_end = None
-    total_queue_wait = 0.0
     loop = asyncio.get_running_loop()
 
-    async def process_part(part: str) -> Tuple[Optional[Dict], float]:
-        nonlocal current_role, tts_start, tts_end, total_queue_wait
+    async def process_part(part: str) -> Optional[Dict]:
+        nonlocal current_role
         part = part.strip()
         if not part:
-            return None, 0.0
+            return None
 
         if part.startswith('[') and part.endswith(']'):
             role = part[1:-1]
             if is_dialog and role in speaker_params:
                 current_role = role
-                return None, 0.0
+                return None
             if part in req.effects:
                 effect_file = req.effects[part]
                 vname = speaker_params[current_role][0] if is_dialog and current_role else req.voice
-                return {'effect': effect_file, 'voice': vname}, 0.0
-            return None, 0.0
+                return {'effect': effect_file, 'voice': vname}
+            return None
 
         if is_dialog:
             if current_role is None:
@@ -500,277 +511,122 @@ async def synthesize(req: TTSRequest):
         else:
             voice_name, speed, noise_s, noise_w = speaker_params[None]
 
-        t0 = time.perf_counter()
-        # Submeter ao pool de processos
-        sample_rate, pcm, synth_time, worker_id = await loop.run_in_executor(
-            tts_pool, _synthesize_text_worker, voice_name, part, speed, noise_s, noise_w
+        # Etapa 1: Fonemização (CPU)
+        _, phoneme_ids, scales = await loop.run_in_executor(
+            cpu_pool, phonemize_and_ids, voice_name, part, speed, noise_s, noise_w
         )
-        t1 = time.perf_counter()
-        if tts_start is None:
-            tts_start = t0
-        tts_end = t1
 
-        # Registar métrica do worker (worker_id)
+        # Etapa 2: Inferência (GPU)
+        sample_rate, pcm, synth_time, worker_id = await loop.run_in_executor(
+            tts_pool, _synthesize_text_worker, voice_name, phoneme_ids, scales
+        )
+
+        # Métricas do worker
         with worker_metrics_lock:
             wm = worker_metrics[worker_id]
             wm["count"] += 1
             wm["total_synth_time"] += synth_time
             wm["jobs"].append(synth_time)
 
-        total_queue_wait += 0.0  # não temos pool.get() com processos, mas podemos medir o tempo de espera no pool
-        return {'pcm_bytes': pcm, 'sample_rate': sample_rate}, t1 - t0
+        with _active_lock:
+            global _active_synthesis_count
+            _active_synthesis_count += 1
 
-    tasks = [process_part(p) for p in parts]
-    results = await asyncio.gather(*tasks)
+        return {'pcm_bytes': pcm, 'sample_rate': sample_rate}
 
-    for seg, _ in results:
-        if seg is not None:
+    results = await asyncio.gather(*[process_part(p) for p in parts])
+    for seg in results:
+        if seg:
             segments_data.append(seg)
 
     if not segments_data:
         raise HTTPException(400, "Nenhum segmento de áudio gerado.")
 
-    tts_wall_time = (tts_end - tts_start) if (tts_start and tts_end) else 0.0
-
     ambient_dict = req.ambient.model_dump() if hasattr(req.ambient, 'model_dump') else req.ambient.dict()
-
-    try:
-        wav_bytes, mix_time = await loop.run_in_executor(
-            mix_pool, mix_and_concat, segments_data, ambient_dict, SAMPLE_RATE_TARGET
-        )
-    except RuntimeError as e:
-        logger.error(f"Erro na mixagem: {e}")
-        raise HTTPException(500, "Falha na mixagem do áudio")
+    wav_bytes, mix_time = await loop.run_in_executor(mix_pool, mix_and_concat, segments_data, ambient_dict, SAMPLE_RATE_TARGET)
 
     t_total = time.perf_counter() - t_total_start
-
     with bench_lock:
         total_times.append(t_total)
-        tts_wall_times.append(tts_wall_time)
+        tts_wall_times.append(t_total - mix_time)  # aproximação
         mix_times.append(mix_time)
-        queue_wait_times.append(total_queue_wait)
+        queue_wait_times.append(0.0)
 
-    record_global_stats(t_total, tts_wall_time, mix_time, total_queue_wait)
-
-    logger.info(
-        f"✅ Síntese concluída | total={t_total:.3f}s | tts_wall={tts_wall_time:.3f}s | "
-        f"mix={mix_time:.3f}s"
-    )
+    record_global_stats(t_total, t_total - mix_time, mix_time, 0.0)
+    logger.info(f"✅ Síntese concluída | total={t_total:.3f}s | mix={mix_time:.3f}s")
     return Response(content=wav_bytes, media_type="audio/wav")
 
-# ---------- Endpoints de saúde ----------
+# ---------- Endpoints de saúde (mantidos) ----------
 @app.get("/started")
-async def started():
-    return Response(status_code=200, content="started")
-
+async def started(): return Response(status_code=200, content="started")
 @app.get("/ready")
-async def ready():
-    if voices_registry:
-        return Response(status_code=200, content="ready")
-    return Response(status_code=503, content="loading model")
-
+async def ready(): return Response(status_code=200 if voices_registry else 503, content="ready" if voices_registry else "loading model")
 @app.get("/live")
-async def live():
-    return Response(status_code=200, content="alive")
-
+async def live(): return Response(status_code=200, content="alive")
 @app.get("/health")
 async def health():
-    data = {
-        "status": "ok",
-        "gpu": True,
-        "voices": list(voices_registry.keys()),
-        "total": len(voices_registry)
-    }
-    return Response(content=json.dumps(data, indent=2, ensure_ascii=False), media_type="application/json")
-
-# ---------- Benchmark ----------
+    return Response(content=json.dumps({"status":"ok","gpu":True,"voices":list(voices_registry.keys()),"total":len(voices_registry)}, indent=2), media_type="application/json")
 @app.get("/bench")
 async def bench():
     with bench_lock:
-        total_stats = compute_stats(total_times)
-        tts_stats = compute_stats(tts_wall_times)
-        mix_stats = compute_stats(mix_times)
-        queue_stats = compute_stats(queue_wait_times)
-
-    worker_data = compute_worker_stats()
-
-    data = {
-        "benchmark_results": {
-            "total": total_stats,
-            "tts_wall": tts_stats,
-            "mix": mix_stats,
-            "queue_wait": queue_stats,
-        },
-        "gpu_workers": worker_data,
-        "configuration": {
-            "status": "ok",
-            "voices": list(voices_registry.keys()),
-            "workers": {
-                "TTS_WORKERS": TTS_WORKERS,
-                "MIX_WORKERS": MIX_WORKERS,
-                "POOL_INIT_SIZE": POOL_INIT_SIZE,
-                "POOL_MAX_SIZE": POOL_MAX_SIZE,
-                "POOL_EXTRA_TTL_MINUTES": POOL_EXTRA_TTL_MINUTES
-            },
-            "gpu": True,
-            "precision": "fp32",
-            "sample_rate": SAMPLE_RATE_TARGET
-        }
-    }
-    json_str = json.dumps(data, indent=2, ensure_ascii=False)
-    return Response(content=json_str, media_type="application/json")
-
-# ---------- Stats ----------
+        ts = compute_stats(total_times)
+        tts = compute_stats(tts_wall_times)
+        ms = compute_stats(mix_times)
+        qs = compute_stats(queue_wait_times)
+    return Response(content=json.dumps({"benchmark_results":{"total":ts,"tts_wall":tts,"mix":ms,"queue_wait":qs},"gpu_workers":dict(worker_metrics),"configuration":{"voices":list(voices_registry.keys()),"TTS_WORKERS":TTS_WORKERS,"CPU_WORKERS":CPU_WORKERS,"MIX_WORKERS":MIX_WORKERS}}, indent=2), media_type="application/json")
 @app.get("/stats")
 async def get_stats():
     with stats_lock:
-        if not stats:
-            return Response(content=json.dumps({"message": "Nenhuma requisição ainda."}, indent=2), media_type="application/json")
-        report = {}
-        for key, values in stats.items():
-            report[key] = compute_stats(values)
-    return Response(content=json.dumps(report, indent=2, ensure_ascii=False), media_type="application/json")
-
-# ---------- Logs ----------
+        if not stats: return Response(content=json.dumps({"message":"Nenhuma requisição ainda."}, indent=2), media_type="application/json")
+        return Response(content=json.dumps({k:compute_stats(v) for k,v in stats.items()}, indent=2), media_type="application/json")
 @app.get("/logs")
-async def get_logs():
-    return Response(content=json.dumps({"logs": memory_handler.buffer}, indent=2, ensure_ascii=False), media_type="application/json")
-
-# ---------- GPU ----------
+async def get_logs(): return Response(content=json.dumps({"logs":memory_handler.buffer}, indent=2), media_type="application/json")
 @app.get("/gpu")
-async def gpu_diagnostics():
-    providers = ort.get_available_providers()
-    nvidia_smi = ""
+async def gpu():
     try:
-        nvidia_smi = subprocess.check_output(["nvidia-smi"], text=True)
-    except Exception as e:
-        nvidia_smi = str(e)
-    data = {
-        "onnxruntime_version": ort.__version__,
-        "providers": providers,
-        "device": ort.get_device(),
-        "nvidia_smi": nvidia_smi.strip(),
-        "ld_library_path": os.environ.get("LD_LIBRARY_PATH", ""),
-        "voices_loaded": list(voices_registry.keys())
-    }
-    return Response(content=json.dumps(data, indent=2, ensure_ascii=False), media_type="application/json")
-
-# ---------- Workers ----------
+        smi = subprocess.check_output(["nvidia-smi"], text=True)
+    except: smi = "nvidia-smi não disponível"
+    return Response(content=json.dumps({"onnxruntime_version":ort.__version__,"providers":ort.get_available_providers(),"device":ort.get_device(),"nvidia_smi":smi.strip(),"ld_library_path":os.environ.get("LD_LIBRARY_PATH",""),"voices_loaded":list(voices_registry.keys())}, indent=2), media_type="application/json")
 @app.get("/workers")
-async def get_workers():
-    data = {
-        "tts_workers": TTS_WORKERS,
-        "mix_workers": MIX_WORKERS,
-        "active_gpu_jobs": active_synthesis_count,  # não atualizado com processos, mas mantemos
-        "per_worker": compute_worker_stats()
-    }
-    return Response(content=json.dumps(data, indent=2, ensure_ascii=False), media_type="application/json")
-
-# ---------- Recursos ----------
+async def workers():
+    return Response(content=json.dumps({"tts_workers":TTS_WORKERS,"cpu_workers":CPU_WORKERS,"mix_workers":MIX_WORKERS,"active_gpu_jobs":_active_synthesis_count,"per_worker":dict(worker_metrics)}, indent=2), media_type="application/json")
 @app.get("/resources")
-async def get_resources():
+async def resources():
     gpu_util = -1.0
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
-            text=True
-        )
-        gpu_util = float(out.strip())
-    except Exception:
-        pass
-
-    cpu_util = -1.0
-    try:
-        import psutil
-        cpu_util = psutil.cpu_percent(interval=0.1)
-    except ImportError:
-        pass
-
-    data = {
-        "gpu_utilization_percent": gpu_util,
-        "cpu_utilization_percent": cpu_util,
-        "cpu_cores_available": os.cpu_count(),
-        "tts_workers": TTS_WORKERS,
-        "mix_workers": MIX_WORKERS
-    }
-    return Response(content=json.dumps(data, indent=2, ensure_ascii=False), media_type="application/json")
-
-# ---------- Reset stats ----------
+    try: gpu_util = float(subprocess.check_output(["nvidia-smi","--query-gpu=utilization.gpu","--format=csv,noheader,nounits"], text=True).strip())
+    except: pass
+    return Response(content=json.dumps({"gpu_utilization_percent":gpu_util,"cpu_cores_available":os.cpu_count(),"tts_workers":TTS_WORKERS,"cpu_workers":CPU_WORKERS,"mix_workers":MIX_WORKERS}, indent=2), media_type="application/json")
 @app.post("/reset_stats")
 async def reset_stats():
     with bench_lock:
-        total_times.clear()
-        tts_wall_times.clear()
-        mix_times.clear()
-        queue_wait_times.clear()
-    with stats_lock:
-        stats.clear()
-    with worker_metrics_lock:
-        worker_metrics.clear()
-    return Response(content=json.dumps({"message": "Estatísticas resetadas."}, indent=2), media_type="application/json")
-
-# ---------- Teste de carga ----------
+        total_times.clear(); tts_wall_times.clear(); mix_times.clear(); queue_wait_times.clear()
+    with stats_lock: stats.clear()
+    with worker_metrics_lock: worker_metrics.clear()
+    return Response(content=json.dumps({"message":"Estatísticas resetadas."}, indent=2), media_type="application/json")
 @app.get("/carga")
-async def get_carga():
-    if not BENCH_DIR.exists():
-        return Response(content=json.dumps({"message": "Nenhum teste de carga foi executado ainda."}, indent=2), media_type="application/json")
-
+async def carga():
+    if not BENCH_DIR.exists(): return Response(content=json.dumps({"message":"Nenhum teste de carga ainda."}, indent=2), media_type="application/json")
     files = sorted(BENCH_DIR.glob("carga_results_*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
-    if not files:
-        return Response(content=json.dumps({"message": "Nenhum ficheiro de carga encontrado."}, indent=2), media_type="application/json")
-
-    latest_file = files[0]
-    try:
-        with open(latest_file, "r") as f:
-            data = json.load(f)
-        result = {
-            "file": latest_file.name,
-            "data": data,
-            "available_files": [f.name for f in files]
-        }
-        return Response(content=json.dumps(result, indent=2, ensure_ascii=False), media_type="application/json")
-    except Exception as e:
-        logger.error(f"Erro ao ler ficheiro de carga {latest_file}: {e}")
-        raise HTTPException(500, "Erro ao ler ficheiro de carga.")
-
+    if not files: return Response(content=json.dumps({"message":"Nenhum ficheiro de carga."}, indent=2), media_type="application/json")
+    with open(files[0]) as f: data = json.load(f)
+    return Response(content=json.dumps({"file":files[0].name,"data":data,"available_files":[f.name for f in files]}, indent=2), media_type="application/json")
 @app.get("/carga_files")
-async def list_carga_files():
-    if not BENCH_DIR.exists():
-        return Response(content=json.dumps({"files": []}, indent=2), media_type="application/json")
-    files = sorted(BENCH_DIR.glob("carga_results_*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
-    return Response(content=json.dumps({"files": [f.name for f in files]}, indent=2), media_type="application/json")
-
+async def carga_files():
+    files = sorted(BENCH_DIR.glob("carga_results_*.json"), key=lambda f: f.stat().st_mtime, reverse=True) if BENCH_DIR.exists() else []
+    return Response(content=json.dumps({"files":[f.name for f in files]}, indent=2), media_type="application/json")
 @app.get("/carga/{file_name}")
-async def get_specific_carga(file_name: str):
-    file_path = BENCH_DIR / file_name
-    if not file_path.exists():
-        raise HTTPException(404, f"Ficheiro {file_name} não encontrado.")
-    try:
-        with open(file_path, "r") as f:
-            data = json.load(f)
-        return Response(content=json.dumps(data, indent=2, ensure_ascii=False), media_type="application/json")
-    except Exception as e:
-        raise HTTPException(500, f"Erro ao ler ficheiro: {e}")
+async def carga_specific(file_name:str):
+    p = BENCH_DIR / file_name
+    if not p.exists(): raise HTTPException(404, "Ficheiro não encontrado")
+    with open(p) as f: return Response(content=json.dumps(json.load(f), indent=2), media_type="application/json")
 
 # ================= NOVO ENDPOINT: TESTE DE CARGA LOCAL =================
 @app.post("/run_load_test")
 async def run_load_test():
-    """Dispara um teste de carga local e guarda os resultados na pasta bench."""
-    import aiohttp
-    import statistics
-    import random
-
-    RAMP_MAX_CONCURRENCY = 51
-    RAMP_STEP = 5
-    RAMP_STEP_DURATION = 30
-    REQUEST_TIMEOUT = 30
-    TEST_URL = "http://localhost:8000/synthesize"
-
-    PACIENTE_VOICE = "mulher_adulta"
-    AMBIENT_FILE = "ubs"
-    AMBIENT_VOLUME_DB = -5.0
-
-    DIALOGOS_BASE = [
+    import aiohttp, statistics, random
+    RAMP_MAX = 51; STEP = 5; DUR = 30; TO = 30
+    VOICE = "mulher_adulta"; AMB = "ubs"; AMB_VOL = -5.0
+    DIALOGS = [
         "[paciente] Estou com dor de cabeça forte. Ele está assim há três dias, doutor.",
         "[paciente] Tenho tido muita tosse, [tosse]... [tosse]..  febre desde ontem.",
         "[paciente] Sinto falta de ar [inspiracao] ao caminhar. Ele já tem histórico de asma.",
@@ -782,94 +638,42 @@ async def run_load_test():
         "[paciente] Quando posso voltar ao trabalho? Precisa de atestado por mais três dias.",
         "[paciente] Ele está com os exames alterados.  Vou precisar de cirurgia?"
     ]
-    EFEITOS_DISPONIVEIS = {
-        "[tosse]": "tosse.wav",
-        "[suspiro]": "suspiro.wav",
-        "[inspiracao]": "inspiracao.wav"
-    }
-
+    EFF = {"[tosse]":"tosse.wav","[suspiro]":"suspiro.wav","[inspiracao]":"inspiracao.wav"}
     BENCH_DIR.mkdir(exist_ok=True)
-    timestamp = int(time.time())
-    carga_file = BENCH_DIR / f"carga_results_local_{timestamp}.json"
+    fname = BENCH_DIR / f"carga_results_local_{int(time.time())}.json"
     results = []
-
     logger.info("Iniciando teste de carga local...")
-
-    async with aiohttp.ClientSession() as session:
-        for concurrency in range(1, RAMP_MAX_CONCURRENCY + 1, RAMP_STEP):
-            logger.info(f"Testando com {concurrency} workers simultâneos...")
-            sem = asyncio.Semaphore(concurrency)
-            start_time = time.perf_counter()
-            success = 0
-            fail = 0
-            latencies = []
-
+    async with aiohttp.ClientSession() as sess:
+        for concurrency in range(1, RAMP_MAX+1, STEP):
+            sem = asyncio.Semaphore(concurrency); start = time.perf_counter(); succ = 0; fail = 0; lats = []
             async def worker():
-                nonlocal success, fail, latencies
-                while time.perf_counter() - start_time < RAMP_STEP_DURATION:
+                nonlocal succ, fail, lats
+                while time.perf_counter() - start < DUR:
                     async with sem:
-                        dialogo = random.choice(DIALOGOS_BASE)
-                        payload = {
-                            "voice": PACIENTE_VOICE,
-                            "text": dialogo,
-                            "effects": EFEITOS_DISPONIVEIS,
-                            "ambient": {"enabled": True, "file": AMBIENT_FILE, "volume_db": AMBIENT_VOLUME_DB}
-                        }
+                        d = random.choice(DIALOGS)
+                        payload = {"voice":VOICE,"text":d,"effects":EFF,"ambient":{"enabled":True,"file":AMB,"volume_db":AMB_VOL}}
                         t0 = time.perf_counter()
                         try:
-                            async with session.post(TEST_URL, json=payload,
-                                                   timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as resp:
-                                if resp.status == 200:
-                                    success += 1
-                                    latencies.append(time.perf_counter() - t0)
-                                else:
-                                    fail += 1
-                        except Exception:
-                            fail += 1
+                            async with sess.post("http://localhost:8000/synthesize", json=payload, timeout=aiohttp.ClientTimeout(total=TO)) as resp:
+                                if resp.status==200:
+                                    succ += 1; lats.append(time.perf_counter()-t0)
+                                else: fail += 1
+                        except: fail += 1
                         await asyncio.sleep(0)
-
             tasks = [asyncio.create_task(worker()) for _ in range(concurrency)]
-            await asyncio.sleep(RAMP_STEP_DURATION)
-            for task in tasks:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
-            total = success + fail
-            if latencies:
-                avg_lat = statistics.mean(latencies)
-                p95 = sorted(latencies)[int(0.95 * len(latencies))]
-            else:
-                avg_lat = 0.0
-                p95 = 0.0
-            throughput = success / RAMP_STEP_DURATION
-            error_rate = fail / total if total else 1.0
-
-            point = {
-                "concurrency": concurrency,
-                "throughput": throughput,
-                "avg_latency": avg_lat,
-                "p95_latency": p95,
-                "error_rate": error_rate,
-                "total_requests": total,
-                "success_count": success
-            }
+            await asyncio.sleep(DUR)
+            for t in tasks: t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            total = succ+fail
+            avg = statistics.mean(lats) if lats else 0.0
+            p95 = sorted(lats)[int(0.95*len(lats))] if lats else 0.0
+            thr = succ/DUR; err = fail/total if total else 1.0
+            point = {"concurrency":concurrency,"throughput":thr,"avg_latency":avg,"p95_latency":p95,"error_rate":err,"total_requests":total,"success_count":succ}
             results.append(point)
-            logger.info(f"  Throughput: {throughput:.2f} req/s | Latência média: {avg_lat:.3f}s | p95: {p95:.3f}s | Erros: {error_rate*100:.1f}%")
-
-            with open(carga_file, "w") as f:
-                json.dump(results, f, indent=2)
-
-    logger.info(f"Teste de carga local concluído. Resultados em {carga_file}")
-
-    return Response(content=json.dumps({
-        "message": "Teste de carga concluído.",
-        "file": carga_file.name,
-        "data": results
-    }, indent=2, ensure_ascii=False), media_type="application/json")
-
+            logger.info(f"  Throughput: {thr:.2f} req/s | Latência média: {avg:.3f}s | p95: {p95:.3f}s | Erros: {err*100:.1f}%")
+            with open(fname,"w") as f: json.dump(results, f, indent=2)
+    logger.info(f"Teste de carga local concluído. Resultados em {fname}")
+    return Response(content=json.dumps({"message":"Teste concluído.","file":fname.name,"data":results}, indent=2), media_type="application/json")
 
 if __name__ == "__main__":
     import uvicorn
