@@ -8,21 +8,15 @@ import subprocess
 import threading
 import asyncio
 import io
-import queue
+import multiprocessing as mp
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Any
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from collections import defaultdict, deque
 
 # ========== FORÇA 1 THREAD NO ONNX RUNTIME (ANTES DE IMPORTAR) ==========
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["ORT_NUM_THREADS"] = "1"
-
-try:
-    from piper import PiperVoice, SynthesisConfig
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "piper-tts"])
-    from piper import PiperVoice, SynthesisConfig
 
 import numpy as np
 import onnxruntime as ort
@@ -44,6 +38,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel, Field
 from pydub import AudioSegment
+
+try:
+    from piper import PiperVoice, SynthesisConfig
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "piper-tts"])
+    from piper import PiperVoice, SynthesisConfig
 
 # ---------- Silenciar logs excessivos do ONNX Runtime ----------
 ort.set_default_logger_severity(4)
@@ -80,11 +80,11 @@ logger.setLevel(logging.DEBUG)
 
 # ---------- Variáveis de ambiente ----------
 MAX_GPU_JOBS = int(os.getenv("MAX_GPU_JOBS", "3"))
-GPU_WORKERS = int(os.getenv("GPU_WORKERS", "2"))
+GPU_WORKERS = int(os.getenv("GPU_WORKERS", "2"))   # será usado para TTS
 MIX_WORKERS = int(os.getenv("MIX_WORKERS", "4"))
 
 POOL_INIT_SIZE = int(os.getenv("POOL_INIT_SIZE", "1"))
-POOL_MAX_SIZE  = int(os.getenv("POOL_MAX_SIZE", "2"))   # ideal para 8GB
+POOL_MAX_SIZE  = int(os.getenv("POOL_MAX_SIZE", str(GPU_WORKERS)))
 POOL_EXTRA_TTL_MINUTES = float(os.getenv("POOL_EXTRA_TTL_MINUTES", "15"))
 POOL_RESET_MINUTES = float(os.getenv("POOL_RESET_MINUTES", "0"))
 
@@ -100,7 +100,6 @@ AMBIENT_DIR.mkdir(exist_ok=True)
 EFFECTS_DIR.mkdir(exist_ok=True)
 BENCH_DIR.mkdir(exist_ok=True)
 
-# ---------- Ficheiro para resultados do teste de carga ----------
 CARGA_FILE = BENCH_DIR / "latest_carga.json"
 
 # ---------- Benchmarks ----------
@@ -110,7 +109,6 @@ queue_wait_times: list[float] = []
 total_times: list[float] = []
 bench_lock = threading.Lock()
 
-# ---------- Métricas por worker (GPU) ----------
 worker_metrics = defaultdict(lambda: {"count": 0, "total_synth_time": 0.0, "jobs": []})
 worker_metrics_lock = threading.Lock()
 
@@ -156,7 +154,6 @@ def compute_worker_stats():
                 stats[f"worker_{wid}"] = {"requests_processed": 0}
         return stats
 
-# ---------- Estatísticas globais ----------
 stats = defaultdict(list)
 stats_lock = threading.Lock()
 
@@ -179,101 +176,120 @@ def compute_stats(values: list[float]) -> dict:
         "count": len(values)
     }
 
-# ---------- Pools e semáforo ----------
-gpu_semaphore: asyncio.Semaphore = None
-gpu_executor: ThreadPoolExecutor = None
-mix_executor: ThreadPoolExecutor = None
+# ====================== PROCESS POOL PARA TTS ======================
+# Determinar núcleos físicos
+def _get_physical_cores():
+    physical = set()
+    try:
+        with open('/proc/cpuinfo') as f:
+            for line in f:
+                if line.startswith('core id'):
+                    physical.add(int(line.split(':')[1].strip()))
+    except Exception:
+        pass
+    if not physical:
+        # fallback: usa os primeiros N núcleos lógicos
+        return list(range(os.cpu_count() // 2))
+    return sorted(physical)
 
-# ========== POOL DE VOZES HÍBRIDA ==========
-class VoicePool:
-    def __init__(self, model_path: str, config_path: str):
-        self.model_path = model_path
-        self.config_path = config_path
-        self.init_size = POOL_INIT_SIZE
-        self.max_size = POOL_MAX_SIZE
-        self.extra_ttl = POOL_EXTRA_TTL_MINUTES * 60.0
-        self.pool = queue.Queue()
-        self._lock = threading.Lock()
-        self._extra_instances: List[Tuple[Any, float]] = []
-        self._expansion_executor = ThreadPoolExecutor(max_workers=2)
-        self._expansion_in_progress = False
+_PHYSICAL_CORES = _get_physical_cores()
+_NUM_PHYSICAL = len(_PHYSICAL_CORES)
 
-        # Criar instâncias base
-        for _ in range(self.init_size):
-            voice = PiperVoice.load(self.model_path, self.config_path, use_cuda=True)
-            self.pool.put(voice)
+TTS_WORKERS = int(os.getenv("TTS_WORKERS", str(_NUM_PHYSICAL)))
+MAX_GPU_JOBS = TTS_WORKERS   # o próprio pool já limita
 
-        # Thread de limpeza periódica das instâncias extra expiradas
-        if self.extra_ttl > 0:
-            def cleaner():
-                while True:
-                    time.sleep(30)
-                    self._remove_expired_extras()
-            threading.Thread(target=cleaner, daemon=True).start()
+# Fila de núcleos para os workers
+_manager = mp.Manager()
+_core_queue = _manager.Queue()
+for _core in _PHYSICAL_CORES:
+    _core_queue.put(_core)
 
-    def _create_instance(self):
-        voice = PiperVoice.load(self.model_path, self.config_path, use_cuda=True)
-        self.pool.put(voice)
-        return voice
+# Cache de vozes local aos processos (será preenchido pelos workers)
+def _init_tts_worker():
+    # Configurar afinidade
+    core = _core_queue.get()
+    try:
+        os.sched_setaffinity(0, {core})
+    except Exception as e:
+        logger.warning(f"Falha ao fixar worker no núcleo {core}: {e}")
 
-    def _create_extra_instances(self, count: int):
-        def _create_and_register():
-            for _ in range(count):
-                with self._lock:
-                    current_total = self.pool.qsize() + len(self._extra_instances)
-                    if current_total >= self.max_size:
-                        break
-                voice = self._create_instance()
-                with self._lock:
-                    self._extra_instances.append((voice, time.time()))
-        self._expansion_executor.submit(_create_and_register)
+    # Reforçar 1 thread
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["ORT_NUM_THREADS"] = "1"
 
-    def _remove_expired_extras(self):
-        with self._lock:
-            now = time.time()
-            surviving = []
-            for voice, created in self._extra_instances:
-                if now - created > self.extra_ttl:
-                    voice._expired = True
-                else:
-                    surviving.append((voice, created))
-            self._extra_instances = surviving
+    # Aplicar monkey patch no onnxruntime dentro deste processo
+    import onnxruntime as _ort
+    _original_ort_session = _ort.InferenceSession
+    def _patched_ort_session(model_path, sess_options=None, providers=None, **kwargs):
+        if sess_options is None:
+            sess_options = _ort.SessionOptions()
+        sess_options.intra_op_num_threads = 1
+        sess_options.execution_mode = _ort.ExecutionMode.ORT_SEQUENTIAL
+        sess_options.graph_optimization_level = _ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        return _original_ort_session(model_path, sess_options, providers=providers, **kwargs)
+    _ort.InferenceSession = _patched_ort_session
 
-    def get(self, timeout=10.0):
-        try:
-            return self.pool.get(timeout=timeout)
-        except queue.Empty:
-            with self._lock:
-                current_total = self.pool.qsize() + len(self._extra_instances)
-                if current_total < self.max_size and not self._expansion_in_progress:
-                    self._expansion_in_progress = True
-                    needed = min(self.max_size - current_total, 4)
-                    if needed > 0:
-                        self._create_extra_instances(needed)
-                    self._expansion_in_progress = False
-            return self.pool.get(timeout=timeout)
+    # Inicializa o cache de vozes local ao processo
+    import __main__
+    __main__._worker_voice_cache = {}
 
-    def put(self, voice):
-        if hasattr(voice, '_expired') and voice._expired:
-            return
-        self.pool.put(voice)
+def _synthesize_text_worker(voice_name: str, text: str, speed: float,
+                            noise_scale: float, noise_w_scale: float):
+    """Função executada no ProcessPoolExecutor."""
+    cache = getattr(sys.modules['__main__'], '_worker_voice_cache', None)
+    if cache is None:
+        cache = {}
+        setattr(sys.modules['__main__'], '_worker_voice_cache', cache)
+    if voice_name not in cache:
+        # Carregar voz – caminhos vêm do registo global (que está no processo principal)
+        # Precisamos de ter acesso ao VOICE_PATHS. Vamos passar como argumento ou usar uma variável global do módulo.
+        model_path, config_path = _get_voice_paths(voice_name)
+        voice = PiperVoice.load(model_path, config_path, use_cuda=True)
+        cache[voice_name] = voice
+    voice = cache[voice_name]
 
-    def reset(self):
-        with self._lock:
-            while True:
-                try:
-                    v = self.pool.get_nowait()
-                    v._expired = True
-                except queue.Empty:
-                    break
-            self._extra_instances.clear()
-            for _ in range(self.init_size):
-                self._create_instance()
+    config = SynthesisConfig(
+        length_scale=speed,
+        noise_scale=noise_scale,
+        noise_w_scale=noise_w_scale,
+        volume=1.0
+    )
+    t0 = time.perf_counter()
+    chunk_generator = voice.synthesize(text, syn_config=config)
+    audio_bytes = b''.join(chunk.audio_int16_bytes for chunk in chunk_generator)
+    sample_rate = voice.config.sample_rate
+    synth_time = time.perf_counter() - t0
+    # Retornar também o PID para identificação do worker (opcional)
+    worker_id = os.getpid()
+    return sample_rate, audio_bytes, synth_time, worker_id
 
-# ---------- Registro de vozes ----------
-voices_registry: Dict[str, Dict] = {}
+# Para que a função worker possa aceder aos caminhos das vozes, temos um dicionário global no módulo principal.
+# No arranque, preenchemos _VOICE_PATHS com os caminhos e usamos uma função auxiliar que será chamada pelos workers.
+_VOICE_PATHS: Dict[str, Tuple[str, str]] = {}
 
-def load_voice_from_folder(voice_name: str, voice_path: Path) -> dict:
+def _get_voice_paths(voice_name):
+    if voice_name not in _VOICE_PATHS:
+        # Carrega do disco (backup)
+        voice_path = VOICES_DIR / voice_name
+        onnx_files = list(voice_path.glob("*.onnx"))
+        if not onnx_files:
+            raise FileNotFoundError(f"Nenhum .onnx em {voice_path}")
+        model_path = str(onnx_files[0])
+        base_name = onnx_files[0].stem
+        json_path = voice_path / f"{base_name}.onnx.json"
+        if not json_path.exists():
+            json_candidates = list(voice_path.glob("*.json"))
+            if not json_candidates:
+                raise FileNotFoundError(f"Nenhum .json para {voice_name}")
+            json_path = json_candidates[0]
+        config_path = str(json_path)
+        _VOICE_PATHS[voice_name] = (model_path, config_path)
+    return _VOICE_PATHS[voice_name]
+
+# ---------- Registro de vozes no processo principal ----------
+voices_registry: Dict[str, Dict] = {}   # apenas metadados
+
+def load_voice_metadata(voice_name: str, voice_path: Path) -> dict:
     onnx_files = list(voice_path.glob("*.onnx"))
     if not onnx_files:
         raise FileNotFoundError(f"Nenhum .onnx em {voice_path}")
@@ -297,24 +313,18 @@ def load_voice_from_folder(voice_name: str, voice_path: Path) -> dict:
         except:
             pass
 
-    pool = VoicePool(model_path, config_path)
-    return {
-        "model_path": model_path,
-        "config_path": config_path,
-        "genero": genero,
-        "pool": pool,
-        "path": voice_path
-    }
+    _VOICE_PATHS[voice_name] = (model_path, config_path)
+    return {"model_path": model_path, "config_path": config_path, "genero": genero, "path": voice_path}
 
-def load_all_voices():
+def load_all_voices_metadata():
     for item in VOICES_DIR.iterdir():
         if item.is_dir():
             name = item.name
             try:
-                voices_registry[name] = load_voice_from_folder(name, item)
-                logger.debug(f"Voz carregada: {name}")
+                voices_registry[name] = load_voice_metadata(name, item)
+                logger.debug(f"Voz registada: {name}")
             except Exception as e:
-                logger.error(f"Falha ao carregar voz {name}: {e}")
+                logger.error(f"Falha ao registar voz {name}: {e}")
 
     for onnx_file in VOICES_DIR.glob("*.onnx"):
         name = onnx_file.stem
@@ -323,55 +333,17 @@ def load_all_voices():
         json_file = onnx_file.with_suffix(".onnx.json")
         if json_file.exists():
             try:
-                pool = VoicePool(str(onnx_file), str(json_file))
-                voices_registry[name] = {
-                    "model_path": str(onnx_file),
-                    "config_path": str(json_file),
-                    "genero": "Personalizada",
-                    "pool": pool,
-                    "path": VOICES_DIR
-                }
-                logger.debug(f"Voz raiz carregada: {name}")
+                model_path = str(onnx_file)
+                config_path = str(json_file)
+                _VOICE_PATHS[name] = (model_path, config_path)
+                voices_registry[name] = {"model_path": model_path, "config_path": config_path, "genero": "Personalizada", "path": VOICES_DIR}
+                logger.debug(f"Voz raiz registada: {name}")
             except Exception as e:
-                logger.error(f"Erro ao carregar voz {name}: {e}")
+                logger.error(f"Erro ao registar voz {name}: {e}")
 
-    logger.info(f"Total de vozes carregadas: {len(voices_registry)}")
+    logger.info(f"Total de vozes registadas: {len(voices_registry)}")
 
-# ---------- Síntese de um fragmento ----------
-def synthesize_text(voice_name: str, text: str, speed: float,
-                    noise_scale: float, noise_w_scale: float):
-    global active_synthesis_count
-    with active_synthesis_lock:
-        active_synthesis_count += 1
-
-    pool = voices_registry[voice_name]["pool"]
-    t_pool_start = time.perf_counter()
-    voice = pool.get()
-    t_pool_end = time.perf_counter()
-    pool_wait = t_pool_end - t_pool_start
-    try:
-        config = SynthesisConfig(
-            length_scale=speed,
-            noise_scale=noise_scale,
-            noise_w_scale=noise_w_scale,
-            volume=1.0
-        )
-        chunk_generator = voice.synthesize(text, syn_config=config)
-        audio_bytes = b''.join(chunk.audio_int16_bytes for chunk in chunk_generator)
-        sample_rate = voice.config.sample_rate
-        synth_time = time.perf_counter() - t_pool_end
-        record_worker_job(synth_time)
-        return sample_rate, audio_bytes, pool_wait
-    except Exception:
-        logger.exception("Erro na síntese de um fragmento")
-        return 22050, b"", pool_wait
-    finally:
-        pool.put(voice)
-        with active_synthesis_lock:
-            if active_synthesis_count > 0:
-                active_synthesis_count -= 1
-
-# ---------- Mixagem com pydub ----------
+# ---------- Mixagem com pydub (processo principal) ----------
 def mix_and_concat(segments_data, ambient_cfg, target_rate=22050):
     t_start = time.perf_counter()
     combined = AudioSegment.empty()
@@ -460,23 +432,19 @@ class TTSRequest(BaseModel):
 # ---------- FastAPI ----------
 app = FastAPI(title="Piper TTS API (GPU)")
 
+# Pools globais (inicializados no startup)
+tts_pool: Optional[ProcessPoolExecutor] = None
+mix_pool: Optional[ThreadPoolExecutor] = None
+gpu_semaphore: asyncio.Semaphore = None   # não será usado com processos; mantemos por compatibilidade, mas pode ser removido
+
 @app.on_event("startup")
 async def startup():
-    global gpu_semaphore, gpu_executor, mix_executor
-    load_all_voices()
+    global tts_pool, mix_pool, gpu_semaphore
+    load_all_voices_metadata()
+    tts_pool = ProcessPoolExecutor(max_workers=TTS_WORKERS, initializer=_init_tts_worker)
+    mix_pool = ThreadPoolExecutor(max_workers=MIX_WORKERS)
     gpu_semaphore = asyncio.Semaphore(MAX_GPU_JOBS)
-    gpu_executor = ThreadPoolExecutor(max_workers=GPU_WORKERS)
-    mix_executor = ThreadPoolExecutor(max_workers=MIX_WORKERS)
-    logger.info(f"Sistema pronto. Workers GPU={GPU_WORKERS}, Mix={MIX_WORKERS}, MaxGPU={MAX_GPU_JOBS}, PoolInit={POOL_INIT_SIZE}, PoolMax={POOL_MAX_SIZE}")
-
-    if POOL_RESET_MINUTES > 0:
-        async def periodic_reset():
-            while True:
-                await asyncio.sleep(POOL_RESET_MINUTES * 60)
-                for entry in voices_registry.values():
-                    entry["pool"].reset()
-                logger.info(f"Reset periódico das pools ({POOL_RESET_MINUTES} min) concluído")
-        asyncio.create_task(periodic_reset())
+    logger.info(f"Sistema pronto. TTS workers={TTS_WORKERS}, Mix={MIX_WORKERS}, MaxGPU={MAX_GPU_JOBS}")
 
 # ================= ENDPOINT DE SÍNTESE =================
 @app.post("/synthesize", response_class=Response)
@@ -532,19 +500,24 @@ async def synthesize(req: TTSRequest):
         else:
             voice_name, speed, noise_s, noise_w = speaker_params[None]
 
-        t0_sem = time.perf_counter()
-        async with gpu_semaphore:
-            t1_sem = time.perf_counter()
-            sem_wait = t1_sem - t0_sem
-            t0 = time.perf_counter()
-            sample_rate, pcm, pool_wait = await loop.run_in_executor(
-                gpu_executor, synthesize_text, voice_name, part, speed, noise_s, noise_w
-            )
-            t1 = time.perf_counter()
-        total_queue_wait += sem_wait + pool_wait
+        t0 = time.perf_counter()
+        # Submeter ao pool de processos
+        sample_rate, pcm, synth_time, worker_id = await loop.run_in_executor(
+            tts_pool, _synthesize_text_worker, voice_name, part, speed, noise_s, noise_w
+        )
+        t1 = time.perf_counter()
         if tts_start is None:
             tts_start = t0
         tts_end = t1
+
+        # Registar métrica do worker (worker_id)
+        with worker_metrics_lock:
+            wm = worker_metrics[worker_id]
+            wm["count"] += 1
+            wm["total_synth_time"] += synth_time
+            wm["jobs"].append(synth_time)
+
+        total_queue_wait += 0.0  # não temos pool.get() com processos, mas podemos medir o tempo de espera no pool
         return {'pcm_bytes': pcm, 'sample_rate': sample_rate}, t1 - t0
 
     tasks = [process_part(p) for p in parts]
@@ -563,7 +536,7 @@ async def synthesize(req: TTSRequest):
 
     try:
         wav_bytes, mix_time = await loop.run_in_executor(
-            mix_executor, mix_and_concat, segments_data, ambient_dict, SAMPLE_RATE_TARGET
+            mix_pool, mix_and_concat, segments_data, ambient_dict, SAMPLE_RATE_TARGET
         )
     except RuntimeError as e:
         logger.error(f"Erro na mixagem: {e}")
@@ -581,7 +554,7 @@ async def synthesize(req: TTSRequest):
 
     logger.info(
         f"✅ Síntese concluída | total={t_total:.3f}s | tts_wall={tts_wall_time:.3f}s | "
-        f"mix={mix_time:.3f}s | fila={total_queue_wait:.3f}s"
+        f"mix={mix_time:.3f}s"
     )
     return Response(content=wav_bytes, media_type="audio/wav")
 
@@ -633,8 +606,7 @@ async def bench():
             "status": "ok",
             "voices": list(voices_registry.keys()),
             "workers": {
-                "MAX_GPU_JOBS": MAX_GPU_JOBS,
-                "GPU_WORKERS": GPU_WORKERS,
+                "TTS_WORKERS": TTS_WORKERS,
                 "MIX_WORKERS": MIX_WORKERS,
                 "POOL_INIT_SIZE": POOL_INIT_SIZE,
                 "POOL_MAX_SIZE": POOL_MAX_SIZE,
@@ -687,10 +659,9 @@ async def gpu_diagnostics():
 @app.get("/workers")
 async def get_workers():
     data = {
-        "tts_workers": GPU_WORKERS,
+        "tts_workers": TTS_WORKERS,
         "mix_workers": MIX_WORKERS,
-        "max_gpu_jobs": MAX_GPU_JOBS,
-        "active_gpu_jobs": active_synthesis_count,
+        "active_gpu_jobs": active_synthesis_count,  # não atualizado com processos, mas mantemos
         "per_worker": compute_worker_stats()
     }
     return Response(content=json.dumps(data, indent=2, ensure_ascii=False), media_type="application/json")
@@ -715,25 +686,14 @@ async def get_resources():
     except ImportError:
         pass
 
-    safe_active = min(active_synthesis_count, MAX_GPU_JOBS)
-
     data = {
         "gpu_utilization_percent": gpu_util,
         "cpu_utilization_percent": cpu_util,
         "cpu_cores_available": os.cpu_count(),
-        "active_gpu_jobs": safe_active,
-        "max_gpu_jobs": MAX_GPU_JOBS,
-        "gpu_workers": GPU_WORKERS,
+        "tts_workers": TTS_WORKERS,
         "mix_workers": MIX_WORKERS
     }
     return Response(content=json.dumps(data, indent=2, ensure_ascii=False), media_type="application/json")
-
-# ---------- Reset das pools (manual) ----------
-@app.post("/reset_pools")
-async def reset_pools():
-    for entry in voices_registry.values():
-        entry["pool"].reset()
-    return Response(content=json.dumps({"message": "Pools resetadas"}, indent=2), media_type="application/json")
 
 # ---------- Reset stats ----------
 @app.post("/reset_stats")
@@ -749,7 +709,7 @@ async def reset_stats():
         worker_metrics.clear()
     return Response(content=json.dumps({"message": "Estatísticas resetadas."}, indent=2), media_type="application/json")
 
-# ---------- Teste de carga (leitura) ----------
+# ---------- Teste de carga ----------
 @app.get("/carga")
 async def get_carga():
     if not BENCH_DIR.exists():
