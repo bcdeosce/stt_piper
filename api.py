@@ -8,11 +8,15 @@ import subprocess
 import threading
 import asyncio
 import io
-import queue                          # <--- ESSENCIAL para VoicePool
+import queue
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict, deque
+
+# ========== FORÇA 1 THREAD NO ONNX RUNTIME (ANTES DE IMPORTAR) ==========
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["ORT_NUM_THREADS"] = "1"
 
 try:
     from piper import PiperVoice, SynthesisConfig
@@ -22,6 +26,20 @@ except ImportError:
 
 import numpy as np
 import onnxruntime as ort
+
+# Monkey patch do InferenceSession para forçar 1 thread
+_original_ort_session = ort.InferenceSession
+
+def _patched_ort_session(model_path, sess_options=None, providers=None, **kwargs):
+    if sess_options is None:
+        sess_options = ort.SessionOptions()
+    sess_options.intra_op_num_threads = 1
+    sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    return _original_ort_session(model_path, sess_options, providers=providers, **kwargs)
+
+ort.InferenceSession = _patched_ort_session
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel, Field
@@ -66,7 +84,7 @@ GPU_WORKERS = int(os.getenv("GPU_WORKERS", "2"))
 MIX_WORKERS = int(os.getenv("MIX_WORKERS", "4"))
 
 POOL_INIT_SIZE = int(os.getenv("POOL_INIT_SIZE", "1"))
-POOL_MAX_SIZE  = int(os.getenv("POOL_MAX_SIZE", str(GPU_WORKERS)))
+POOL_MAX_SIZE  = int(os.getenv("POOL_MAX_SIZE", "2"))   # ideal para 8GB
 POOL_EXTRA_TTL_MINUTES = float(os.getenv("POOL_EXTRA_TTL_MINUTES", "15"))
 POOL_RESET_MINUTES = float(os.getenv("POOL_RESET_MINUTES", "0"))
 
@@ -166,7 +184,7 @@ gpu_semaphore: asyncio.Semaphore = None
 gpu_executor: ThreadPoolExecutor = None
 mix_executor: ThreadPoolExecutor = None
 
-# ========== NOVA POOL DE VOZES HÍBRIDA ==========
+# ========== POOL DE VOZES HÍBRIDA ==========
 class VoicePool:
     def __init__(self, model_path: str, config_path: str):
         self.model_path = model_path
@@ -225,7 +243,6 @@ class VoicePool:
         try:
             return self.pool.get(timeout=timeout)
         except queue.Empty:
-            # Expansão em background se necessário
             with self._lock:
                 current_total = self.pool.qsize() + len(self._extra_instances)
                 if current_total < self.max_size and not self._expansion_in_progress:
@@ -234,7 +251,6 @@ class VoicePool:
                     if needed > 0:
                         self._create_extra_instances(needed)
                     self._expansion_in_progress = False
-            # Tenta novamente
             return self.pool.get(timeout=timeout)
 
     def put(self, voice):
@@ -453,7 +469,6 @@ async def startup():
     mix_executor = ThreadPoolExecutor(max_workers=MIX_WORKERS)
     logger.info(f"Sistema pronto. Workers GPU={GPU_WORKERS}, Mix={MIX_WORKERS}, MaxGPU={MAX_GPU_JOBS}, PoolInit={POOL_INIT_SIZE}, PoolMax={POOL_MAX_SIZE}")
 
-    # Reset periódico manual (se configurado)
     if POOL_RESET_MINUTES > 0:
         async def periodic_reset():
             while True:
