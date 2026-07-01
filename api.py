@@ -110,7 +110,6 @@ def compute_stats(values):
 
 # ====================== DETEÇÃO DE NÚCLEOS (ROBUSTA) ======================
 def _get_cores():
-    """Retorna (physical_cores, ht_cores) de forma segura."""
     try:
         physical_logical, ht_logical = set(), set()
         total = os.cpu_count() or 4
@@ -131,16 +130,13 @@ def _get_cores():
             return sorted(physical_logical), sorted(ht_logical)
     except Exception as e:
         logger.warning(f"Falha na deteção fina de núcleos: {e}")
-
-    # Fallback genérico
     total = os.cpu_count() or 4
     return list(range(total // 2)), list(range(total // 2, total))
 
 _PHYSICAL, _HT = _get_cores()
 def _parse_cores(var, default):
     val = os.getenv(var, "")
-    if val:
-        return [int(x.strip()) for x in val.split(",")]
+    if val: return [int(x.strip()) for x in val.split(",")]
     return default
 
 TTS_CORES = _parse_cores("TTS_CORES", _HT[:TTS_WORKERS])
@@ -153,15 +149,12 @@ logger.info(f"TTS_CORES (HT): {TTS_CORES}, CPU_CORES (HT): {CPU_CORES}, MIX_CORE
 # ====================== POOL GPU ======================
 _manager = mp.Manager()
 _tts_core_queue = _manager.Queue()
-for core in TTS_CORES:
-    _tts_core_queue.put(core)
+for core in TTS_CORES: _tts_core_queue.put(core)
 
 def _init_tts_worker():
     core = _tts_core_queue.get()
-    try:
-        os.sched_setaffinity(0, {core})
-    except Exception as e:
-        logger.warning(f"Falha ao fixar worker TTS no núcleo {core}: {e}")
+    try: os.sched_setaffinity(0, {core})
+    except Exception as e: logger.warning(f"Falha ao fixar worker TTS no núcleo {core}: {e}")
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["ORT_NUM_THREADS"] = "1"
     import onnxruntime as _ort
@@ -184,19 +177,15 @@ def _synthesize_text_worker(voice_name, phoneme_ids, scales_tuple):
         voice = PiperVoice.load(model_path, config_path, use_cuda=True)
         cache[voice_name] = voice
     voice = cache[voice_name]
-
     if not phoneme_ids:
         logger.error(f"[GPU worker {os.getpid()}] phoneme_ids vazio para voz {voice_name}")
         raise ValueError("phoneme_ids está vazio")
-
     length_scale, noise_scale, noise_w = scales_tuple
     phoneme_ids_array = np.expand_dims(np.array(phoneme_ids, dtype=np.int64), 0)
     phoneme_ids_lengths = np.array([phoneme_ids_array.shape[1]], dtype=np.int64)
     scales = np.array([noise_scale, length_scale, noise_w], dtype=np.float32)
-
     args = {"input": phoneme_ids_array, "input_lengths": phoneme_ids_lengths, "scales": scales}
     if voice.config.num_speakers > 1: args["sid"] = np.array([0], dtype=np.int64)
-
     t0 = time.perf_counter()
     audio = voice.session.run(None, args)[0].squeeze()
     audio = np.clip(audio * 32767, -32767, 32767).astype(np.int16)
@@ -264,7 +253,6 @@ def phonemize_and_ids(voice_name, text, speed, noise_scale, noise_w_scale):
             logger.debug(f"[CPU fonemização] Carregando voz {voice_name} (CPU)")
             _cpu_voice_cache[voice_name] = PiperVoice.load(mp_path, cp_path, use_cuda=False)
         voice = _cpu_voice_cache[voice_name]
-
     logger.debug(f"[CPU fonemização] Processando texto: '{text[:60]}...'")
     try:
         phonemes = voice.phonemize(text)
@@ -454,48 +442,163 @@ async def synthesize(req: TTSRequest):
     return Response(content=wav_bytes, media_type="audio/wav")
 
 # ---------- Endpoints de saúde ----------
-@app.get("/started"): return Response(status_code=200, content="started")
-@app.get("/ready"): return Response(status_code=200 if voices_registry else 503, content="ready" if voices_registry else "loading model")
-@app.get("/live"): return Response(status_code=200, content="alive")
-@app.get("/health"): return Response(content=json.dumps({"status":"ok","gpu":True,"voices":list(voices_registry.keys()),"total":len(voices_registry)}, indent=2), media_type="application/json")
-@app.get("/bench"):
+@app.get("/started")
+async def started():
+    return Response(status_code=200, content="started")
+
+@app.get("/ready")
+async def ready():
+    if voices_registry:
+        return Response(status_code=200, content="ready")
+    return Response(status_code=503, content="loading model")
+
+@app.get("/live")
+async def live():
+    return Response(status_code=200, content="alive")
+
+@app.get("/health")
+async def health():
+    data = {
+        "status": "ok",
+        "gpu": True,
+        "voices": list(voices_registry.keys()),
+        "total": len(voices_registry)
+    }
+    return Response(content=json.dumps(data, indent=2, ensure_ascii=False), media_type="application/json")
+
+@app.get("/bench")
+async def bench():
     with bench_lock:
-        ts = compute_stats(total_times); tts = compute_stats(tts_wall_times); ms = compute_stats(mix_times); qs = compute_stats(queue_wait_times)
-    return Response(content=json.dumps({"benchmark_results":{"total":ts,"tts_wall":tts,"mix":ms,"queue_wait":qs},"gpu_workers":dict(worker_metrics),"configuration":{"voices":list(voices_registry.keys()),"TTS_WORKERS":TTS_WORKERS,"CPU_WORKERS":CPU_WORKERS,"MIX_WORKERS":MIX_WORKERS}}, indent=2), media_type="application/json")
-@app.get("/stats"):
+        ts = compute_stats(total_times)
+        tts = compute_stats(tts_wall_times)
+        ms = compute_stats(mix_times)
+        qs = compute_stats(queue_wait_times)
+    worker_data = dict(worker_metrics)
+    data = {
+        "benchmark_results": {
+            "total": ts,
+            "tts_wall": tts,
+            "mix": ms,
+            "queue_wait": qs
+        },
+        "gpu_workers": worker_data,
+        "configuration": {
+            "voices": list(voices_registry.keys()),
+            "TTS_WORKERS": TTS_WORKERS,
+            "CPU_WORKERS": CPU_WORKERS,
+            "MIX_WORKERS": MIX_WORKERS
+        }
+    }
+    json_str = json.dumps(data, indent=2, ensure_ascii=False)
+    return Response(content=json_str, media_type="application/json")
+
+@app.get("/stats")
+async def get_stats():
     with stats_lock:
-        if not stats: return Response(content=json.dumps({"message":"Nenhuma requisição ainda."}, indent=2), media_type="application/json")
-        return Response(content=json.dumps({k:compute_stats(v) for k,v in stats.items()}, indent=2), media_type="application/json")
-@app.get("/logs"): return Response(content=json.dumps({"logs":memory_handler.buffer}, indent=2), media_type="application/json")
-@app.get("/gpu"):
-    try: smi = subprocess.check_output(["nvidia-smi"], text=True)
-    except: smi = "nvidia-smi não disponível"
-    return Response(content=json.dumps({"onnxruntime_version":ort.__version__,"providers":ort.get_available_providers(),"device":ort.get_device(),"nvidia_smi":smi.strip(),"ld_library_path":os.environ.get("LD_LIBRARY_PATH",""),"voices_loaded":list(voices_registry.keys())}, indent=2), media_type="application/json")
-@app.get("/workers"):
-    return Response(content=json.dumps({"tts_workers":TTS_WORKERS,"cpu_workers":CPU_WORKERS,"mix_workers":MIX_WORKERS,"active_gpu_jobs":_active_synthesis_count,"per_worker":dict(worker_metrics)}, indent=2), media_type="application/json")
-@app.get("/resources"):
+        if not stats:
+            return Response(content=json.dumps({"message": "Nenhuma requisição ainda."}, indent=2), media_type="application/json")
+        report = {}
+        for key, values in stats.items():
+            report[key] = compute_stats(values)
+    return Response(content=json.dumps(report, indent=2, ensure_ascii=False), media_type="application/json")
+
+@app.get("/logs")
+async def get_logs():
+    return Response(content=json.dumps({"logs": memory_handler.buffer}, indent=2, ensure_ascii=False), media_type="application/json")
+
+@app.get("/gpu")
+async def gpu_diagnostics():
+    providers = ort.get_available_providers()
+    nvidia_smi = ""
+    try:
+        nvidia_smi = subprocess.check_output(["nvidia-smi"], text=True)
+    except Exception as e:
+        nvidia_smi = f"nvidia-smi não disponível: {e}"
+    data = {
+        "onnxruntime_version": ort.__version__,
+        "providers": providers,
+        "device": ort.get_device(),
+        "nvidia_smi": nvidia_smi.strip(),
+        "ld_library_path": os.environ.get("LD_LIBRARY_PATH", ""),
+        "voices_loaded": list(voices_registry.keys())
+    }
+    return Response(content=json.dumps(data, indent=2, ensure_ascii=False), media_type="application/json")
+
+@app.get("/workers")
+async def workers():
+    data = {
+        "tts_workers": TTS_WORKERS,
+        "cpu_workers": CPU_WORKERS,
+        "mix_workers": MIX_WORKERS,
+        "active_gpu_jobs": _active_synthesis_count,
+        "per_worker": dict(worker_metrics)
+    }
+    return Response(content=json.dumps(data, indent=2, ensure_ascii=False), media_type="application/json")
+
+@app.get("/resources")
+async def resources():
     gpu_util = -1.0
-    try: gpu_util = float(subprocess.check_output(["nvidia-smi","--query-gpu=utilization.gpu","--format=csv,noheader,nounits"], text=True).strip())
-    except: pass
-    return Response(content=json.dumps({"gpu_utilization_percent":gpu_util,"cpu_cores_available":os.cpu_count(),"tts_workers":TTS_WORKERS,"cpu_workers":CPU_WORKERS,"mix_workers":MIX_WORKERS}, indent=2), media_type="application/json")
-@app.post("/reset_stats"):
-    with bench_lock: total_times.clear(); tts_wall_times.clear(); mix_times.clear(); queue_wait_times.clear()
-    with stats_lock: stats.clear()
-    with worker_metrics_lock: worker_metrics.clear()
-    return Response(content=json.dumps({"message":"Estatísticas resetadas."}, indent=2), media_type="application/json")
-@app.get("/carga"):
-    if not BENCH_DIR.exists(): return Response(content=json.dumps({"message":"Nenhum teste de carga ainda."}, indent=2), media_type="application/json")
+    try:
+        gpu_util = float(subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+            text=True
+        ).strip())
+    except Exception:
+        pass
+    data = {
+        "gpu_utilization_percent": gpu_util,
+        "cpu_cores_available": os.cpu_count(),
+        "tts_workers": TTS_WORKERS,
+        "cpu_workers": CPU_WORKERS,
+        "mix_workers": MIX_WORKERS
+    }
+    return Response(content=json.dumps(data, indent=2, ensure_ascii=False), media_type="application/json")
+
+@app.post("/reset_stats")
+async def reset_stats():
+    with bench_lock:
+        total_times.clear()
+        tts_wall_times.clear()
+        mix_times.clear()
+        queue_wait_times.clear()
+    with stats_lock:
+        stats.clear()
+    with worker_metrics_lock:
+        worker_metrics.clear()
+    return Response(content=json.dumps({"message": "Estatísticas resetadas."}, indent=2), media_type="application/json")
+
+@app.get("/carga")
+async def carga():
+    if not BENCH_DIR.exists():
+        return Response(content=json.dumps({"message": "Nenhum teste de carga ainda."}, indent=2), media_type="application/json")
     files = sorted(BENCH_DIR.glob("carga_results_*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
-    if not files: return Response(content=json.dumps({"message":"Nenhum ficheiro de carga."}, indent=2), media_type="application/json")
-    with open(files[0]) as f: data = json.load(f)
-    return Response(content=json.dumps({"file":files[0].name,"data":data,"available_files":[f.name for f in files]}, indent=2), media_type="application/json")
-@app.get("/carga_files"):
-    files = sorted(BENCH_DIR.glob("carga_results_*.json"), key=lambda f: f.stat().st_mtime, reverse=True) if BENCH_DIR.exists() else []
-    return Response(content=json.dumps({"files":[f.name for f in files]}, indent=2), media_type="application/json")
-@app.get("/carga/{file_name}"):
+    if not files:
+        return Response(content=json.dumps({"message": "Nenhum ficheiro de carga."}, indent=2), media_type="application/json")
+    with open(files[0]) as f:
+        data = json.load(f)
+    result = {
+        "file": files[0].name,
+        "data": data,
+        "available_files": [f.name for f in files]
+    }
+    return Response(content=json.dumps(result, indent=2, ensure_ascii=False), media_type="application/json")
+
+@app.get("/carga_files")
+async def carga_files():
+    if BENCH_DIR.exists():
+        files = sorted(BENCH_DIR.glob("carga_results_*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
+    else:
+        files = []
+    return Response(content=json.dumps({"files": [f.name for f in files]}, indent=2), media_type="application/json")
+
+@app.get("/carga/{file_name}")
+async def carga_specific(file_name: str):
     p = BENCH_DIR / file_name
-    if not p.exists(): raise HTTPException(404, "Ficheiro não encontrado")
-    with open(p) as f: return Response(content=json.dumps(json.load(f), indent=2), media_type="application/json")
+    if not p.exists():
+        raise HTTPException(404, "Ficheiro não encontrado")
+    with open(p) as f:
+        data = json.load(f)
+    return Response(content=json.dumps(data, indent=2, ensure_ascii=False), media_type="application/json")
 
 # ================= TESTE DE CARGA LOCAL =================
 @app.post("/run_load_test")
@@ -522,7 +625,11 @@ async def run_load_test():
     logger.info("Iniciando teste de carga local...")
     async with aiohttp.ClientSession() as sess:
         for concurrency in range(1, RAMP_MAX+1, STEP):
-            sem = asyncio.Semaphore(concurrency); start = time.perf_counter(); succ = 0; fail = 0; lats = []
+            sem = asyncio.Semaphore(concurrency)
+            start = time.perf_counter()
+            succ = 0
+            fail = 0
+            lats = []
             async def worker():
                 nonlocal succ, fail, lats
                 while time.perf_counter() - start < DUR:
@@ -532,22 +639,37 @@ async def run_load_test():
                         t0 = time.perf_counter()
                         try:
                             async with sess.post("http://localhost:8000/synthesize", json=payload, timeout=aiohttp.ClientTimeout(total=TO)) as resp:
-                                if resp.status==200: succ += 1; lats.append(time.perf_counter()-t0)
-                                else: fail += 1
-                        except: fail += 1
+                                if resp.status==200:
+                                    succ += 1
+                                    lats.append(time.perf_counter()-t0)
+                                else:
+                                    fail += 1
+                        except Exception:
+                            fail += 1
                         await asyncio.sleep(0)
             tasks = [asyncio.create_task(worker()) for _ in range(concurrency)]
             await asyncio.sleep(DUR)
-            for t in tasks: t.cancel()
+            for t in tasks:
+                t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             total = succ+fail
             avg = statistics.mean(lats) if lats else 0.0
             p95 = sorted(lats)[int(0.95*len(lats))] if lats else 0.0
-            thr = succ/DUR; err = fail/total if total else 1.0
-            point = {"concurrency":concurrency,"throughput":thr,"avg_latency":avg,"p95_latency":p95,"error_rate":err,"total_requests":total,"success_count":succ}
+            thr = succ/DUR
+            err = fail/total if total else 1.0
+            point = {
+                "concurrency": concurrency,
+                "throughput": thr,
+                "avg_latency": avg,
+                "p95_latency": p95,
+                "error_rate": err,
+                "total_requests": total,
+                "success_count": succ
+            }
             results.append(point)
             logger.info(f"  Throughput: {thr:.2f} req/s | Latência média: {avg:.3f}s | p95: {p95:.3f}s | Erros: {err*100:.1f}%")
-            with open(fname,"w") as f: json.dump(results, f, indent=2)
+            with open(fname,"w") as f:
+                json.dump(results, f, indent=2)
     logger.info(f"Teste de carga local concluído. Resultados em {fname}")
     return Response(content=json.dumps({"message":"Teste concluído.","file":fname.name,"data":results}, indent=2), media_type="application/json")
 
